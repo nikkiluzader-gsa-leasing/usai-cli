@@ -123,6 +123,7 @@ Limits, enforced by the script rather than by asking the model nicely:
 - Everything stays inside the current folder and its subfolders (use `/cd` to change it).
 - Credential files are never read or changed: `.clasprc.json` (your Google sign-in), `.env` files, `credentials.json`, keys and certificates, and USAi CLI's own `~\.usai` folder. Nothing inside `.git`, and not `.clasp.json`, can be edited either.
 - Only `git` and `clasp` can run, and only allowlisted subcommands. Commands start directly, never through a shell, so the model can't chain or redirect anything.
+- Commands run in the current folder, or in a subfolder the model names (say, a clasp project cloned into `testing\`). Before `clasp push` or a deployment, the confirmation shows the script ID from the `.clasp.json` that clasp will use, so you can check it's the project you mean.
 - Blocked: `git reset`, `clean`, `checkout`, `restore`, `rm`, `rebase`, `config`, force pushes and branch deletion; `clasp run`, `login`, `logout`, `create`, `delete` and `--force`. The model is told why, so it can tell you the command to run yourself.
 - Commands that wait for typed input fail instead of hanging. Esc stops a running command, and any command is stopped after the request timeout (300 seconds).
 

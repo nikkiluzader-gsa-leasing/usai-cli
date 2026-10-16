@@ -998,7 +998,9 @@ $script:FullToolsPrompt = @'
 You have tools for the user's working directory: list_files, read_file and search_files to look at files, and edit_file and write_file to change them{0}. When a request is about their files or code, look instead of guessing, and read only what you need.
 - Read a file before changing it, and prefer edit_file for changes to existing files. old_string must match the file exactly, without the line numbers read_file adds.
 - The user sees a diff of every change and approves it, and approves every command. If the user declines, stop and ask what they would like instead.
-- Some files (credentials, anything in .git, .clasp.json) and some commands are blocked. If a tool says something is blocked, tell the user the command so they can run it themselves; do not look for a way around it.
+- Credential files (such as .clasprc.json and .env) can't be read or changed. Files in .git and .clasp.json can be read but not changed with edit_file or write_file; git and clasp commands still create and update them as usual (clasp clone and pull write .clasp.json, for example).
+- run_command runs in the working directory unless you pass dir, a subfolder to run in. Use dir for a clasp project in a subfolder: clasp clone writes into, and clasp status, pull and push act on, the folder they run in.
+- Some commands and options are blocked. If a tool says something is blocked, first check whether an allowed way does the same thing (such as dir); otherwise tell the user the command so they can run it themselves. Do not look for a way around a block.
 - Only push, deploy or create versions when the user has asked for that in this conversation. Check status before pushing, and report the result.
 '@
 
@@ -1080,12 +1082,13 @@ function New-RunCommandDef([string[]]$Programs) {
         "${p}: " + ((@($r.read) + @($r.change) + @($r.special) + @($r.confirm.Keys)) -join ', ')
     }
     $blocked = foreach ($p in $Programs) { "${p}: $($script:CommandRules[$p].blocked)" }
-    $desc = "Run a $($Programs -join ' or ') command in the user's working directory (no shell, so no pipes, redirection or chaining). " +
+    $desc = "Run a $($Programs -join ' or ') command in the user's working directory or a subfolder of it (no shell, so no pipes, redirection or chaining). " +
     "Allowed subcommands - $($lists -join '; '). Blocked - $($blocked -join '; '). " +
     'Commands cannot read typed input or open an editor, so always pass -m to git commit. The user approves each command; pushes and deployments need extra confirmation.'
     return (New-ToolDef 'run_command' $desc @{
             program = @{ type = 'string'; enum = $Programs; description = 'The program to run.' }
             args    = @{ type = 'array'; items = @{ type = 'string' }; description = 'Arguments after the program name, one per item. The first is the subcommand, e.g. ["commit", "-m", "Fix date parsing in onEdit"].' }
+            dir     = @{ type = 'string'; description = 'Subfolder of the working directory to run in, e.g. "testing" for a clasp project cloned there. Default ".".' }
         } @('program', 'args'))
 }
 
@@ -1643,7 +1646,7 @@ function Get-NodeShimTarget([string]$CmdPath) {
     return @{ Node = $node; Script = $js }
 }
 
-function New-CommandStartInfo([string]$Path, [string[]]$Arguments) {
+function New-CommandStartInfo([string]$Path, [string[]]$Arguments, [string]$Dir) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -1652,7 +1655,7 @@ function New-CommandStartInfo([string]$Path, [string[]]$Arguments) {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
     $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding $false
-    $psi.WorkingDirectory = (Get-Location).ProviderPath
+    $psi.WorkingDirectory = $Dir
     # Fail instead of waiting for input nobody can type: credential prompts, editors, pagers.
     $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
     $psi.EnvironmentVariables['GIT_EDITOR'] = ':'
@@ -1759,6 +1762,26 @@ function Format-CommandLine([string]$Program, [string[]]$Arguments) {
     return (@($Program) + @($shown)) -join ' '
 }
 
+# Names the Apps Script project clasp would act on from Dir, the way clasp finds it:
+# the nearest .clasp.json in Dir or a folder above it.
+function Get-ClaspProject([string]$Dir) {
+    $d = $Dir
+    while ($d) {
+        $f = Join-Path $d '.clasp.json'
+        if (Test-Path -LiteralPath $f -PathType Leaf) {
+            $id = ''
+            try { $id = [string]([IO.File]::ReadAllText($f) | ConvertFrom-Json).scriptId } catch { }
+            $where = Get-DisplayPath $f
+            if ($id) { return "$id (from $where)" }
+            return $where
+        }
+        $parent = Split-Path -Parent $d
+        if (-not $parent -or $parent -eq $d) { break }
+        $d = $parent
+    }
+    return $null
+}
+
 function Invoke-RunCommand($A) {
     $program = [string]$A.program
     $arguments = Get-CommandArgs $A
@@ -1773,16 +1796,25 @@ function Invoke-RunCommand($A) {
     if (Test-UnderFolder $path (Get-Location).ProviderPath) {
         return "Error: blocked because the $program found on the PATH ($path) is inside the working directory."
     }
+    $dir = Resolve-ToolPath ([string]$A.dir)   # throws if outside the working directory
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return "Error: folder '$($A.dir)' not found. Create it with write_file (any file inside it), or leave dir out." }
+    $why = Get-ProtectedReason $dir -ForWrite
+    if ($why) { return "Error: running commands in '$($A.dir)' is blocked because $why." }
 
-    $startInfo = New-CommandStartInfo $path $arguments   # throws if an argument can't be passed safely
+    $startInfo = New-CommandStartInfo $path $arguments $dir   # throws if an argument can't be passed safely
 
     $sub = $arguments[0]
     $ok = switch ($rule.Level) {
-        'read' { Request-Approval "$program $sub" 'Allow?' (Get-Location).ProviderPath -IsRead }
-        'change' { Request-Approval "$program $sub" 'Run this command?' (Get-Location).ProviderPath }
+        'read' { Request-Approval "$program $sub" 'Allow?' $dir -IsRead }
+        'change' { Request-Approval "$program $sub" 'Run this command?' $dir }
         'confirm' {
             $note = $script:ConfirmNotes["$program $sub"]
             if (-not $note) { $note = $script:ConfirmNotes["$program *"] }
+            if ($program -eq 'clasp') {
+                $project = Get-ClaspProject $dir
+                if ($project) { $note += " Project: $project" }
+                else { $note += ' No .clasp.json was found for this folder, so clasp will probably fail.' }
+            }
             Read-ConfirmWord $rule.Word $note
         }
     }
@@ -1828,7 +1860,11 @@ function Get-ToolSummary([string]$Name, $A) {
         }
         'edit_file' { return [string]$A.path }
         'write_file' { return [string]$A.path }
-        'run_command' { return (Format-CommandLine ([string]$A.program) (Get-CommandArgs $A)) }
+        'run_command' {
+            $s = Format-CommandLine ([string]$A.program) (Get-CommandArgs $A)
+            if ($A.dir -and [string]$A.dir -ne '.') { $s += "   (in $($A.dir))" }
+            return $s
+        }
     }
     return ''
 }
