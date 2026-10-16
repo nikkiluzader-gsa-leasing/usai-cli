@@ -130,13 +130,14 @@ You can also just ask about your files, and the model will look for what it need
 ```
 > which of these scripts send email?
   * search_files "Send-MailMessage"
-    Allow? [y]es  [a]lways for this tool  [n]o
+    Allow? [y]es  [a] search_files this session  [f] search_files in this folder  [n]o
 ```
 
 Each time it wants to look at something, it tells you what and waits for your answer:
 
-- **y**: allow this one request.
+- **y** (or Enter): allow this one request.
 - **a**: allow this kind of request for the rest of this session.
+- **f**: allow this kind of request in this folder from now on, including in future sessions.
 - **n**: refuse. The model will stop and ask you what to do instead.
 
 It can **list** folders, **read** text files and **search** file contents. It can only see the current folder and the folders inside it, and it never reads files that hold passwords or sign-ins, such as `.clasprc.json` or `.env`.
@@ -157,6 +158,13 @@ Ask for a change, and the model can make it. Before anything is saved, you see w
 
 Press **y** to save or **n** to refuse. Enter alone doesn't count, so you can't save a change by accident.
 
+Tired of saying yes? Two more answers save you from being asked again:
+
+- **a**: allow **all file edits** for the rest of this session.
+- **f**: allow all file edits in **this folder** (and the folders inside it), now and every time you use `usai` here. It's remembered until you remove it.
+
+You still see every diff, so you can catch anything odd. `/revert` still works too.
+
 Changed your mind afterwards? Type `/revert` to put the file back the way it was. Each `/revert` undoes one more change from this session. A copy of each original is also kept in `~\.usai\backups`.
 
 ### Let it run git and clasp
@@ -169,9 +177,9 @@ If you have `git` or Google's `clasp` installed, the model can run them for you,
 
 It runs `clasp pull`, reads the files, shows you the fix, and runs `clasp push`, asking you at each step:
 
-- Commands that only look, like `git status` or `clasp status`, ask **y** / **a** / **n**, like file reads.
-- Commands that change something, like `git commit` or `clasp pull`, need **y** each time.
-- `git push`, `clasp push`, and creating versions or deployments make you **type** `push` or `deploy`. `clasp push` replaces the live code that your sheets and forms run, so take a moment to check before you type it.
+- Commands that only look, like `git status` or `clasp status`, ask like file reads; Enter means yes.
+- Commands that change something, like `git commit` or `clasp pull`, need **y**. Here too, **a** allows that one command (say, every `git commit`) for the session, and **f** allows it in this folder for good. It doesn't cover other commands: allowing `git commit` doesn't allow `git add`.
+- `git push`, `clasp push`, and creating versions or deployments make you **type** `push` or `deploy`. `clasp push` replaces the live code that your sheets and forms run, so take a moment to check before you type it. These can't be pre-approved with **a** or **f**.
 
 Commands that could throw away work, like `git reset` or `git checkout`, are blocked, as are `clasp run`, `clasp login` and any program other than git and clasp. When something is blocked, the model tells you the command so you can run it yourself if you really want to.
 
@@ -180,6 +188,13 @@ Commands that could throw away work, like `git reset` or `git checkout`, are blo
 - `/tools read` lets the model look at files but not change them or run commands.
 - `/tools off` turns tools off completely; `/tools on` turns everything back on.
 - `/approve on` stops the questions for reads and look-only commands (use `/approve off` to bring them back). File changes and other commands still ask.
+- `/permissions` lists everything you've answered **a** or **f** to. `/permissions remove 2` forgets one saved folder, and `/permissions reset` forgets everything.
+
+### Give it standing instructions
+
+If you find yourself telling the model the same things each time ("this is the leasing tracker script, Code.js has the triggers, always run clasp status before pushing"), put them in a file named `USAI.md` in that folder. Everything in it is added to every conversation you start there or in a folder inside it. A `USAI.md` in `~\.usai` applies everywhere.
+
+Type `/init` and the model will look around and write a first version for you to approve and edit.
 
 > Everything the model reads, and the output of every command it runs, is sent to USAi, just like an attachment. Be careful with **a** and `/approve on` in folders that contain information you shouldn't share.
 
@@ -214,8 +229,9 @@ Every conversation is saved automatically as you go.
 | Copy the last answer to the clipboard | `/copy` |
 | Save the conversation as a document | `/export` (or `/export notes.md`) |
 | See how long the conversation is and your settings | `/context` |
+| Shrink a long conversation into a summary and keep going | `/compact` (or `/compact focus on the Code.js changes`) |
 
-**When to start fresh:** long conversations cost more, because each message re-sends everything before it, and models get less focused as conversations grow. When you switch topics, use `/clear`.
+**When to start fresh:** long conversations cost more, because each message re-sends everything before it, and models get less focused as conversations grow. When you switch topics, use `/clear`. To keep going on the same task with less baggage, use `/compact`. It replaces the conversation with a summary the model writes, so later messages cost less. The tool suggests it when a conversation gets long.
 
 ## 8. Adjusting how it responds
 
@@ -289,10 +305,12 @@ STOP AN ANSWER    Esc
 PREVIOUS INPUT    Up arrow
 
 MODELS            /model   /model <part of name>   /models
-CONVERSATIONS     /clear   /resume   /retry   /undo   /copy   /export   /context
+CONVERSATIONS     /clear   /resume   /retry   /undo   /copy   /export   /context   /compact
 FILES             /file <paths>   /drop   /cd <folder>   /ls   /pwd
-TOOLS             /tools on|read|off   /approve on|off   /revert
-                  reads: y / a / n     changes: y / n    push/deploy: type the word
+TOOLS             /tools on|read|off   /approve on|off   /revert   /permissions
+                  y yes   a always this session   f always in this folder   n no
+                  push/deploy: type the word, every time
+INSTRUCTIONS      USAI.md in a folder (or ~\.usai)   /init to write one
 SETTINGS          /system   /temperature   /max-tokens   /stream on|off
 KEY               /key reset
 HELP / QUIT       /help   /exit

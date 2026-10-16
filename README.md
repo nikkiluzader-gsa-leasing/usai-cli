@@ -82,6 +82,9 @@ Attachments can be text files, images (png, jpg, gif, webp) or PDFs. Whether a m
 | `/tools on\|read\|off` | Let the model use files and git/clasp in the current folder; `read` means look only (see below) |
 | `/approve on\|off` | Skip the approval prompt for file reads and read-only commands |
 | `/revert` | Undo the last file change the model made (repeat to go further back) |
+| `/permissions [remove <n> \| reset]` | Show or remove your "always" approvals |
+| `/compact [focus]` | Replace a long conversation with a summary, to save budget and keep the model focused |
+| `/init` | Have the model write a `USAI.md` with instructions for this folder (see below) |
 | `/cd`, `/ls`, `/pwd` | Move around and look at folders without leaving the chat |
 | `/key reset` | Replace your saved API key |
 | `/help` | Show all commands |
@@ -93,17 +96,25 @@ When tools are on (the default), the model can work with the files in your curre
 
 | Tool | What it does | How you approve it |
 | --- | --- | --- |
-| **list_files**, **read_file**, **search_files** | Look at files | **y** (yes), **a** (always, for the rest of the session) or **n** (no) |
-| **edit_file**, **write_file** | Change or create a file | Shows a red/green diff first; press **y** to save. Enter alone doesn't count |
-| **run_command** | Run an allowed `git` or `clasp` subcommand | Read-only commands (`git status`, `clasp status`) ask y/a/n. Others (`git commit`, `clasp pull`) need **y** every time. `git push`, `clasp push` and deployments make you type `push` or `deploy` |
+| **list_files**, **read_file**, **search_files** | Look at files | **y** or Enter |
+| **edit_file**, **write_file** | Change or create a file | Shows a red/green diff first, then **y** to save. Enter alone doesn't count |
+| **run_command** | Run an allowed `git` or `clasp` subcommand | **y** for each command, or Enter for read-only ones like `git status`. `git push`, `clasp push` and deployments make you type `push` or `deploy` |
+
+Instead of **y** you can also answer:
+
+- **a**: always allow this for the rest of the session
+- **f**: always allow this in the current folder and its subfolders. This one is saved, so it still applies next time you start `usai` here
+- **n**: no
+
+What "this" covers depends on the step: one read tool (`read_file`), **all file edits**, or one command (`git commit`, which doesn't cover `git add`). The diff is still shown for approved edits, and `/revert` still works. `git push`, `clasp push` and deployments can't be pre-approved; they ask for the word every time. **f** isn't offered in your home folder or at the top of a drive, where it would cover too much. `/permissions` lists what you've allowed and removes it.
 
 So you can ask for a whole job, and approve each step as it goes:
 
 ```
 > pull my Apps Script project, fix the date bug in Code.js, and push it
-  * run_command clasp pull                         Run this command? [y]es [n]o
-  * read_file Code.js                              Allow? [y]es [a]lways [n]o
-  * edit_file Code.js        (diff shown)          Save these changes? [y]es [n]o
+  * run_command clasp pull                         Run this command? [y]es [a] [f] [n]o
+  * read_file Code.js                              Allow? [y]es [a] [f] [n]o
+  * edit_file Code.js        (diff shown)          Save these changes? [y]es [a] [f] [n]o
   * run_command clasp push                         Type push to confirm
 ```
 
@@ -115,9 +126,15 @@ Limits, enforced by the script rather than by asking the model nicely:
 - Blocked: `git reset`, `clean`, `checkout`, `restore`, `rm`, `rebase`, `config`, force pushes and branch deletion; `clasp run`, `login`, `logout`, `create`, `delete` and `--force`. The model is told why, so it can tell you the command to run yourself.
 - Commands that wait for typed input fail instead of hanging. Esc stops a running command, and any command is stopped after the request timeout (300 seconds).
 
-Before every file change, the original is copied to `~\.usai\backups`. `/revert` undoes the model's last change in this session; run it again to go further back.
+Before every file change, the original is copied to `~\.usai\backups`. `/revert` undoes the model's last change in this session; run it again to go further back. `write_file`, which replaces a whole file, only works on a file the model has read in this conversation and that hasn't changed since; otherwise it's told to read the file first.
 
-`/tools read` turns off editing and commands but keeps the three look-only tools. Models that don't support tool calling are detected automatically and just chat normally. Print mode (`-p`) never uses tools, since nobody is there to approve them.
+`/tools read` turns off editing and commands but keeps the three look-only tools.
+
+## Project instructions (USAI.md)
+
+Put a `USAI.md` file in a folder, and its contents are added to the model's instructions in every conversation started there, or in any folder below it. Use it for what you'd otherwise repeat each time: what the project is, which files matter, how you push, and style rules. `~\.usai\USAI.md` applies everywhere. When several apply, the more specific one comes last. The banner shows which ones are loaded.
+
+`/init` has the model look around the folder and write a `USAI.md` for you, with the usual diff and approval. A `USAI.md` that came with someone else's project is instructions you didn't write, so read it before trusting it. Every step still needs your approval either way. Models that don't support tool calling are detected automatically and just chat normally. Print mode (`-p`) never uses tools, since nobody is there to approve them.
 
 ## What gets sent where
 
@@ -133,7 +150,8 @@ Stored locally in `~\.usai`:
 | File | Contents |
 | --- | --- |
 | `api-key.xml` | Your API key, encrypted with Windows DPAPI (only your Windows account on this machine can read it) |
-| `config.json` | Your settings: default model, system prompt, temperature, and so on |
+| `config.json` | Your settings: default model, system prompt, temperature, folders where you chose **f**, and so on |
+| `USAI.md` | Optional instructions for every conversation (see above) |
 | `sessions\*.json` | Saved conversations (images and PDFs are left out) |
 | `backups\*` | Copies of files from before the model changed them |
 | `bin\usai.ps1` | The installed copy of the script |

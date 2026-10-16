@@ -91,6 +91,7 @@ $script:Config = [ordered]@{
     tools        = $true     # let the model use tools in the working folder
     readOnly     = $false    # tools can only list/read/search: no edits or commands
     autoApprove  = $false    # skip the approval prompt for reads and read-only commands
+    folderRules  = @()       # [f]older approvals: @{ path; allow = @('edits', 'git commit', ...) }
     temperature  = $null     # $null = model default
     maxTokens    = $null     # $null = model default
 }
@@ -109,6 +110,9 @@ $script:Unsupported = @{}      # model id -> options it rejected this session
 $script:ApprovedTools = @{}    # tools approved with "always" this session
 $script:EditLog = New-Object System.Collections.Generic.List[object]   # file changes /revert can undo
 $script:CommandPaths = $null   # program name -> full path, found on first use
+$script:ReadHashes = @{}       # file -> hash of the contents the model last read or wrote
+$script:SessionUsage = @{ In = 0; Out = 0; Has = $false }
+$script:LongHintAt = 0         # context size (tokens) at which the /compact hint was last shown
 $script:LastRequestAt = $null
 
 $script:InputRedirected = $false
@@ -344,8 +348,43 @@ function Get-SystemPrompt {
     $base = $script:DefaultSystemPrompt
     if ($script:Config.systemPrompt) { $base = [string]$script:Config.systemPrompt }
     if (Test-ToolsActive) { $base += "`n" + (Get-ToolsPrompt) }
+    $instructions = Get-InstructionsText
+    if ($instructions) {
+        $base += "`n`nThe user wrote these instructions in USAI.md files. Follow them unless they conflict with the rules above.`n$instructions"
+    }
     $cwd = (Get-Location).ProviderPath
     return "$base`n`nEnvironment:`n- Today: $(Get-Date -Format 'dddd, MMMM d, yyyy')`n- Working directory: $cwd`n- Shell: PowerShell $($PSVersionTable.PSVersion)"
+}
+
+# USAI.md files: ~\.usai\USAI.md, then one in each folder from the drive root down to
+# the working directory, so more specific instructions come last.
+function Get-InstructionFiles {
+    $files = New-Object System.Collections.Generic.List[string]
+    $userFile = Join-Path $script:ConfigDir 'USAI.md'
+    if (Test-Path -LiteralPath $userFile -PathType Leaf) { $files.Add($userFile) }
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $d = (Get-Location).ProviderPath
+    while ($d) {
+        $dirs.Insert(0, $d)
+        $parent = Split-Path -Parent $d
+        if (-not $parent -or $parent -eq $d) { break }
+        $d = $parent
+    }
+    foreach ($dir in $dirs) {
+        $f = Join-Path $dir 'USAI.md'
+        if ((Test-Path -LiteralPath $f -PathType Leaf) -and $files -notcontains $f) { $files.Add($f) }
+    }
+    return $files.ToArray()
+}
+
+function Get-InstructionsText {
+    $parts = foreach ($f in (Get-InstructionFiles)) {
+        try { $t = [IO.File]::ReadAllText($f, [Text.Encoding]::UTF8).Trim() } catch { continue }
+        if (-not $t) { continue }
+        if ($t.Length -gt 20000) { $t = $t.Substring(0, 20000) + "`n(truncated)" }
+        "<instructions path=`"$f`">`n$t`n</instructions>"
+    }
+    return (@($parts) -join "`n")
 }
 
 # USAi allows 3 chat calls per second per key; keep a little space between calls.
@@ -1102,6 +1141,9 @@ function Get-ToolsNote {
         $programs = @(Get-CommandPrograms)
         if ($programs.Count -gt 0) { $s += ' and run ' + ($programs -join '/') }
     }
+    $here = (Get-Location).ProviderPath
+    $saved = @((Get-FolderRules) | Where-Object { Test-UnderFolder $here ([string]$_.path) } | ForEach-Object { @($_.allow) })
+    if ($saved -contains 'edits') { $s += ' (edits pre-approved in this folder)' }
     if ($script:Config.autoApprove) { return "$s, reads without asking" }
     return "$s, asks first"
 }
@@ -1214,6 +1256,7 @@ function Invoke-ReadFile($A) {
     }
     if ($fi.Length -gt 20MB) { return "Error: '$($A.path)' is too large to read ($(Format-Size $fi.Length))." }
 
+    $script:ReadHashes[$full] = Get-ContentHash ([IO.File]::ReadAllBytes($full))
     $all = [IO.File]::ReadAllLines($full, [Text.Encoding]::UTF8)
     if ($all.Count -eq 0) { return '(empty file)' }
     $offset = 1
@@ -1293,6 +1336,11 @@ function Read-EditableFile([string]$Full, [string]$Shown) {
     catch { throw "'$Shown' isn't UTF-8 text (it may use an older Windows encoding), so it can't be edited safely." }
     $crlf = ([regex]::Matches($text, "`r`n").Count * 2) -gt ([regex]::Matches($text, "`n").Count)
     return @{ Text = $text.Replace("`r`n", "`n"); Bytes = $bytes; Bom = $bom; Crlf = $crlf }
+}
+
+function Get-ContentHash([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToBase64String($sha.ComputeHash($Bytes)) } finally { $sha.Dispose() }
 }
 
 function ConvertTo-FileBytes([string]$Text, [bool]$Bom, [bool]$Crlf) {
@@ -1417,6 +1465,12 @@ function Invoke-FileChange([string]$Name, $A) {
 
     if ($Name -eq 'write_file') {
         if ($null -eq $A.content) { return 'Error: content is required.' }
+        if ($exists) {
+            # write_file replaces the whole file, so the model must have seen what it replaces.
+            $seen = $script:ReadHashes[$full]
+            if (-not $seen) { return "Error: '$shown' already exists and you haven't read it in this conversation. Read it with read_file first, or use edit_file for a targeted change." }
+            if ($seen -ne (Get-ContentHash $old.Bytes)) { return "Error: '$shown' has changed since you last read it. Read it again before replacing it." }
+        }
         $newText = ([string]$A.content).Replace("`r`n", "`n")
     }
     else {
@@ -1442,7 +1496,7 @@ function Invoke-FileChange([string]$Name, $A) {
     $removed = @($ops | Where-Object { $_.Op -eq '-' }).Count
     Show-Diff $ops
     $question = if ($exists) { "Save these changes to ${shown}?" } else { "Create ${shown}?" }
-    if (-not (Read-YesNo $question)) { return $script:DeclinedText }
+    if (-not (Request-Approval 'edits' $question $full)) { return $script:DeclinedText }
 
     $bytes = ConvertTo-FileBytes $newText ($exists -and $old.Bom) ($exists -and $old.Crlf)
     $before = if ($exists) { $old.Bytes } else { $null }
@@ -1450,6 +1504,7 @@ function Invoke-FileChange([string]$Name, $A) {
     $dir = Split-Path -Parent $full
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     [IO.File]::WriteAllBytes($full, $bytes)
+    $script:ReadHashes[$full] = Get-ContentHash $bytes
     $script:EditLog.Add(@{ Path = $full; Before = $before; After = $bytes })
 
     if ($exists) { return "Saved $shown ($added line(s) added, $removed removed)." }
@@ -1723,8 +1778,8 @@ function Invoke-RunCommand($A) {
 
     $sub = $arguments[0]
     $ok = switch ($rule.Level) {
-        'read' { Request-ToolApproval "$program $sub" "$program $sub" }
-        'change' { Read-YesNo 'Run this command?' }
+        'read' { Request-Approval "$program $sub" 'Allow?' (Get-Location).ProviderPath -IsRead }
+        'change' { Request-Approval "$program $sub" 'Run this command?' (Get-Location).ProviderPath }
         'confirm' {
             $note = $script:ConfirmNotes["$program $sub"]
             if (-not $note) { $note = $script:ConfirmNotes["$program *"] }
@@ -1778,23 +1833,145 @@ function Get-ToolSummary([string]$Name, $A) {
     return ''
 }
 
-# For reads: y / a (always) / n, and Enter means yes.
-function Request-ToolApproval([string]$Name, [string]$AlwaysLabel = 'this tool') {
-    if ($script:Config.autoApprove -or $script:ApprovedTools.ContainsKey($Name)) { return $true }
-    if ($script:InputRedirected) { return $false }
+# ---- Permissions -------------------------------------------------------------
+# An "always" answer allows a key: a read tool such as read_file, 'edits' (every file
+# change), or one command such as 'git commit'. [a] lasts for this session. [f] is saved
+# in config.json for the working folder and its subfolders, until /permissions removes it.
+# git push, clasp push and deployments are never covered: they always ask for the word.
+
+function Get-FolderRules {
+    return , @(@($script:Config.folderRules) | Where-Object { $_ -and $_.path })
+}
+
+# Returns where a grant for Key at Path comes from ('this session' or a folder), or $null.
+function Get-GrantSource([string]$Key, [string]$Path) {
+    if ($script:ApprovedTools.ContainsKey($Key)) { return 'this session' }
+    foreach ($r in (Get-FolderRules)) {
+        if ((@($r.allow) -contains $Key) -and (Test-UnderFolder $Path ([string]$r.path))) { return "in $($r.path)" }
+    }
+    return $null
+}
+
+function Set-FolderRules($Rules) {
+    $script:Config.folderRules = @($Rules | ForEach-Object { [ordered]@{ path = [string]$_.path; allow = @(@($_.allow) | ForEach-Object { [string]$_ }) } })
+    Save-Config
+}
+
+function Add-FolderGrant([string]$Key, [string]$Folder) {
+    $rules = New-Object System.Collections.Generic.List[object]
+    $found = $false
+    foreach ($r in (Get-FolderRules)) {
+        $allow = @(@($r.allow) | ForEach-Object { [string]$_ })
+        if ([string]$r.path -eq $Folder) {
+            $found = $true
+            if ($allow -notcontains $Key) { $allow += $Key }
+        }
+        $rules.Add(@{ path = [string]$r.path; allow = $allow })
+    }
+    if (-not $found) { $rules.Add(@{ path = $Folder; allow = @($Key) }) }
+    Set-FolderRules $rules
+}
+
+# Saving an approval for your whole home folder or a drive would cover far too much.
+function Test-BroadFolder([string]$Folder) {
+    $f = $Folder.TrimEnd('\', '/')
+    if (-not $f -or $f -eq ([IO.Path]::GetPathRoot($Folder)).TrimEnd('\', '/')) { return $true }
+    return ($f -eq $HOME.TrimEnd('\', '/'))
+}
+
+function Get-GrantLabel([string]$Key) {
+    if ($Key -eq 'edits') { return 'all file edits' }
+    if ($script:ReadToolNames -contains $Key) { return $Key }
+    return "'$Key'"
+}
+
+# Asks before a tool step and returns $true to go ahead. For reads, Enter means yes;
+# for changes and commands it takes y, a or f.
+function Request-Approval([string]$Key, [string]$Question, [string]$Path, [switch]$IsRead) {
+    if ($IsRead -and $script:Config.autoApprove) { return $true }
+    $source = Get-GrantSource $Key $Path
+    if ($source) {
+        if (-not $IsRead) { Write-Dim "    (allowed: $(Get-GrantLabel $Key) $source)" }
+        return $true
+    }
+    $folder = (Get-Location).ProviderPath
+    $canSave = -not (Test-BroadFolder $folder)
+    switch (Read-ApprovalChoice $Question (Get-GrantLabel $Key) ([bool]$IsRead) $canSave) {
+        'y' { return $true }
+        'a' { $script:ApprovedTools[$Key] = $true; return $true }
+        'f' {
+            Add-FolderGrant $Key $folder
+            Write-Dim "    Saved: $(Get-GrantLabel $Key) allowed in $folder. /permissions to review or remove."
+            return $true
+        }
+    }
+    return $false
+}
+
+# The key-press part of Request-Approval. Returns y, a, f or n.
+function Read-ApprovalChoice([string]$Question, [string]$Label, [bool]$EnterMeansYes, [bool]$CanSave) {
+    if ($script:InputRedirected) { return 'n' }
     while (Test-KeyAvailable) { [void][Console]::ReadKey($true) }   # ignore keys typed earlier
-    Write-Host '    Allow? ' -NoNewline -ForegroundColor Yellow
-    Write-Host "[y]es  [a]lways for $AlwaysLabel  [n]o " -NoNewline -ForegroundColor DarkGray
+    Write-Host "    $Question " -NoNewline -ForegroundColor Yellow
+    if (-not $EnterMeansYes) { Write-Host ''; Write-Host '    ' -NoNewline }
+    $options = "[y]es  [a] $Label this session  "
+    if ($CanSave) { $options += "[f] $Label in this folder  " }
+    Write-Host ($options + '[n]o ') -NoNewline -ForegroundColor DarkGray
     while ($true) {
         $k = [Console]::ReadKey($true)
-        $c = [string]$k.KeyChar
-        if ($k.Key -eq [ConsoleKey]::Enter -or $c -eq 'y') { Write-Host 'yes' -ForegroundColor Green; return $true }
-        if ($c -eq 'a') { $script:ApprovedTools[$Name] = $true; Write-Host 'always' -ForegroundColor Green; return $true }
-        if ($c -eq 'n' -or $k.Key -eq [ConsoleKey]::Escape) { Write-Host 'no' -ForegroundColor Red; return $false }
+        $c = ([string]$k.KeyChar).ToLowerInvariant()
+        if ($c -eq 'y' -or ($EnterMeansYes -and $k.Key -eq [ConsoleKey]::Enter)) { Write-Host 'yes' -ForegroundColor Green; return 'y' }
+        if ($c -eq 'a') { Write-Host 'always this session' -ForegroundColor Green; return 'a' }
+        if ($c -eq 'f' -and $CanSave) { Write-Host 'always in this folder' -ForegroundColor Green; return 'f' }
+        if ($c -eq 'n' -or $k.Key -eq [ConsoleKey]::Escape) { Write-Host 'no' -ForegroundColor Red; return 'n' }
     }
 }
 
-# For changes: only y means yes; Enter alone doesn't count.
+function Show-Permissions {
+    Write-Host ''
+    Write-Host 'Allowed this session' -ForegroundColor Cyan
+    $keys = @($script:ApprovedTools.Keys | Sort-Object)
+    if ($keys.Count -eq 0) { Write-Dim '  (nothing)' }
+    foreach ($k in $keys) { Write-Host "  $(Get-GrantLabel $k)" }
+    Write-Host ''
+    Write-Host 'Saved for folders' -ForegroundColor Cyan
+    $rules = Get-FolderRules
+    if ($rules.Count -eq 0) { Write-Dim '  (nothing)' }
+    $cwd = (Get-Location).ProviderPath
+    for ($i = 0; $i -lt $rules.Count; $i++) {
+        $here = if (Test-UnderFolder $cwd ([string]$rules[$i].path)) { '  (applies here)' } else { '' }
+        Write-Host ('  {0}. {1}{2}' -f ($i + 1), $rules[$i].path, $here)
+        Write-Dim ('     ' + ((@($rules[$i].allow) | ForEach-Object { Get-GrantLabel $_ }) -join ', '))
+    }
+    if ($script:Config.autoApprove) { Write-Host ''; Write-Dim '  /approve is on: reads and read-only commands never ask.' }
+    Write-Host ''
+    Write-Dim '  /permissions remove <number>   forget a saved folder'
+    Write-Dim '  /permissions reset             forget everything above'
+    Write-Dim '  git push, clasp push and deployments always ask you to type the word.'
+}
+
+function Invoke-PermissionsCommand([string]$Arg) {
+    $rules = Get-FolderRules
+    if (-not $Arg) { Show-Permissions; return }
+    if ($Arg -match '^remove\s+(\d+)$') {
+        $n = [int]$Matches[1]
+        if ($n -lt 1 -or $n -gt $rules.Count) { Write-Warn "No saved folder number $n. /permissions lists them."; return }
+        $gone = $rules[$n - 1].path
+        Set-FolderRules @($rules | Where-Object { $_ -ne $rules[$n - 1] })
+        Write-Ok "Forgot the approvals saved for $gone."
+        return
+    }
+    if ($Arg -eq 'reset') {
+        if (-not (Read-YesNo 'Forget all approvals, for this session and every saved folder?')) { return }
+        $script:ApprovedTools = @{}
+        Set-FolderRules @()
+        Write-Ok 'All approvals forgotten. Everything will ask again.'
+        return
+    }
+    Write-Warn 'Usage: /permissions | /permissions remove <number> | /permissions reset'
+}
+
+# For other yes/no questions: only y means yes; Enter alone doesn't count.
 function Read-YesNo([string]$Question) {
     if ($script:InputRedirected) { return $false }
     while (Test-KeyAvailable) { [void][Console]::ReadKey($true) }
@@ -1837,7 +2014,7 @@ function Invoke-ToolCall($Call) {
 
     try {
         if ($script:ReadToolNames -contains $name) {
-            if (-not (Request-ToolApproval $name)) { return $script:DeclinedText }
+            if (-not (Request-Approval $name 'Allow?' (Get-Location).ProviderPath -IsRead)) { return $script:DeclinedText }
             $out = switch ($name) {
                 'list_files' { Invoke-ListFiles $a }
                 'read_file' { Invoke-ReadFile $a }
@@ -2045,6 +2222,9 @@ function Invoke-Turn {
             $usage.Has = $true
             $usage.In += [int]$r.Usage.prompt_tokens
             $usage.Out += [int]$r.Usage.completion_tokens
+            $script:SessionUsage.Has = $true
+            $script:SessionUsage.In += [int]$r.Usage.prompt_tokens
+            $script:SessionUsage.Out += [int]$r.Usage.completion_tokens
         }
 
         if ($r.Cancelled) {
@@ -2070,6 +2250,7 @@ function Invoke-Turn {
 
         if ($calls.Count -eq 0) {
             Show-Usage $usage
+            Show-LongConversationHint $r
             Save-Session
             return $true
         }
@@ -2086,6 +2267,74 @@ function Invoke-Turn {
     Save-Session
     return $true
 }
+
+# Long conversations cost more (every message re-sends them) and blur the model's focus.
+function Show-LongConversationHint($Result) {
+    $tokens = 0
+    if ($Result.Usage -and $null -ne $Result.Usage.prompt_tokens) { $tokens = [int]$Result.Usage.prompt_tokens }
+    else { $tokens = [int]((Get-ContextChars) / 4) }
+    if ($tokens -lt 60000 -or $tokens -lt $script:LongHintAt + 40000) { return }
+    $script:LongHintAt = $tokens
+    Write-Dim ('  This conversation is ~{0:N0} tokens and every message re-sends it. /compact summarizes it; /clear starts fresh.' -f $tokens)
+}
+
+function Get-ContextChars {
+    $chars = (Get-SystemPrompt).Length
+    foreach ($m in $script:Messages) { $chars += (ConvertTo-SavableContent $m.content).Length }
+    return $chars
+}
+
+function Get-Transcript {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($m in $script:Messages) {
+        $text = ConvertTo-SavableContent $m.content
+        $limit = 8000
+        $head = switch ($m.role) { 'user' { 'User' } 'assistant' { 'Assistant' } 'tool' { $limit = 3000; 'Tool result' } default { $m.role } }
+        if ($text.Length -gt $limit) { $text = $text.Substring(0, $limit) + ' ...(cut)' }
+        if ($text) { [void]$sb.AppendLine("### $head").AppendLine($text).AppendLine() }
+        foreach ($tc in @($m.tool_calls)) {
+            if (-not $tc) { continue }
+            $a = [string]$tc.function.arguments
+            if ($a.Length -gt 1500) { $a = $a.Substring(0, 1500) + ' ...(cut)' }
+            [void]$sb.AppendLine("### Assistant used $($tc.function.name)").AppendLine($a).AppendLine()
+        }
+    }
+    return $sb.ToString()
+}
+
+# Replaces the conversation with a summary the model writes, to free up context.
+# The history goes in as plain text, since some providers reject tool messages without tools.
+function Invoke-Compact([string]$Focus) {
+    if ($script:Messages.Count -lt 2) { Write-Warn 'Nothing to compact yet.'; return }
+    $before = Get-ContextChars
+    $ask = 'Summarize the conversation above so it can continue in a fresh context. Include the goal, decisions made, ' +
+    'files read or changed (with paths) and their current state, commands run and their results, and anything still to do. ' +
+    'Keep exact names, paths and values. Reply with the summary only.'
+    if ($Focus) { $ask += " Pay particular attention to: $Focus" }
+    $saved = $script:Messages
+    $script:Messages = New-Object System.Collections.Generic.List[object]
+    $script:Messages.Add(@{ role = 'user'; content = "<conversation>`n$(Get-Transcript)</conversation>`n`n$ask" })
+    Write-Dim '  Summarizing the conversation (Esc to cancel)...'
+    try { $r = Invoke-Request -WithTools $false -Quiet }
+    finally { $script:Messages = $saved }
+
+    if ($r.Cancelled) { Write-Warn 'Cancelled; the conversation is unchanged.'; return }
+    if ($r.Error -or -not $r.Text.Trim()) {
+        if ($r.Error) { Show-RequestError $r } else { Write-Warn 'The model returned an empty summary.' }
+        Write-Dim '  The conversation is unchanged.'
+        return
+    }
+    $script:Messages = New-Object System.Collections.Generic.List[object]
+    $script:Messages.Add(@{ role = 'user'; prompt = '(summary of the earlier conversation)'; content = "[Summary of our earlier conversation, written when it was compacted]`n`n$($r.Text.Trim())" })
+    $script:Messages.Add(@{ role = 'assistant'; content = 'Thanks, I have the summary and will continue from there.' })
+    $script:LongHintAt = 0
+    Save-Session
+    Write-Ok ('Compacted: about {0:N0} -> {1:N0} tokens.' -f [int]($before / 4), [int]((Get-ContextChars) / 4))
+}
+
+$script:InitPrompt = @'
+Look through this folder and write a USAI.md file at its top level. USAI.md is added to your instructions in every future conversation started here, so include what would help then: what the project is, how it is organized, the commands used to work with it (for example the clasp or git workflow), and conventions to follow. Keep it short, under 60 lines, and only include things that are true and useful. If a USAI.md already exists, read it first and improve it rather than replacing what is useful.
+'@
 
 function Submit-Prompt([string]$Prompt) {
     $mentions = Get-MentionAttachments $Prompt
@@ -2177,6 +2426,9 @@ $script:Commands = [ordered]@{
     '/tools'   = 'Let the model use files (and git/clasp) in this folder: /tools on|read|off'
     '/approve' = 'Skip the approval prompt for file reads and read-only commands: /approve on|off'
     '/revert'  = 'Undo the last file change the model made (repeat to go further back)'
+    '/permissions' = 'Show or remove "always" approvals: /permissions [remove <n> | reset]'
+    '/compact' = 'Summarize the conversation to free up context: /compact [what to focus on]'
+    '/init'    = 'Have the model write a USAI.md with instructions for this folder'
     '/temperature' = 'Response creativity 0.0-1.0, or "default": /temperature 0.2'
     '/max-tokens'  = 'Maximum reply length in tokens, or "default": /max-tokens 4000'
     '/cd'      = 'Change directory'
@@ -2204,11 +2456,16 @@ function Show-Help {
     Write-Host 'Tools' -ForegroundColor Cyan
     Write-Host '  With /tools on, the model can list, read and search files under the current folder,'
     Write-Host '  edit them, and run allowlisted git and clasp commands. It asks before each step:'
-    Write-Host '    reads and read-only commands   [y]es / [a]lways / [n]o'
-    Write-Host '    file changes and commands      shows the diff or command; press y (Enter does not count)'
-    Write-Host '    git push, clasp push, deploys  type the word shown to confirm'
-    Write-Host '  It cannot leave this folder or touch credential files. /revert undoes a file change.'
-    Write-Host '  /tools read limits it to looking only.'
+    Write-Host '    reads and read-only commands   [y]es (or Enter) / [a]lways this session / [f]older / [n]o'
+    Write-Host '    file changes and commands      shows the diff or command; y / a / f / n (Enter does not count)'
+    Write-Host '    git push, clasp push, deploys  type the word shown, every time'
+    Write-Host '  [a] allows that kind of step for the rest of this session; [f] saves it for this folder'
+    Write-Host '  and its subfolders (/permissions to review). /revert undoes a file change.'
+    Write-Host '  It cannot leave this folder or touch credential files. /tools read limits it to looking only.'
+    Write-Host ''
+    Write-Host 'Instructions' -ForegroundColor Cyan
+    Write-Host '  USAI.md in this folder (or a parent, or ~\.usai) is added to every conversation here.'
+    Write-Host '  /init has the model write one for you.'
     Write-Host ''
     Write-Host 'Attachments: text files, images (png/jpg/gif/webp), and PDFs (model support varies).' -ForegroundColor DarkGray
     Write-Host 'Do not send sensitive, classified, or otherwise restricted data.' -ForegroundColor DarkGray
@@ -2410,8 +2667,7 @@ function Invoke-ModelCommand([string]$Arg) {
 }
 
 function Show-Context {
-    $chars = (Get-SystemPrompt).Length
-    foreach ($m in $script:Messages) { $chars += (ConvertTo-SavableContent $m.content).Length }
+    $chars = Get-ContextChars
     $turns = @($script:Messages | Where-Object { $_.role -eq 'user' }).Count
     Write-Host ''
     Write-Host ("  Model:        {0}" -f $script:CurrentModel)
@@ -2421,6 +2677,9 @@ function Show-Context {
     $toolState = if ($script:Config.tools -and -not (Test-ToolsActive)) { 'not supported by this model' } else { Get-ToolsNote }
     Write-Host ("  Tools:        {0}" -f $toolState)
     if ($script:EditLog.Count -gt 0) { Write-Host ("  File changes: {0} this session (/revert to undo)" -f $script:EditLog.Count) }
+    $instructionFiles = @(Get-InstructionFiles)
+    if ($instructionFiles.Count -gt 0) { Write-Host ("  USAI.md:      {0}" -f ($instructionFiles -join ', ')) }
+    if ($script:SessionUsage.Has) { Write-Host ("  Used so far:  {0:N0} in / {1:N0} out tokens this session" -f $script:SessionUsage.In, $script:SessionUsage.Out) }
     Write-Host ("  Temperature:  {0}" -f $(if ($null -ne $script:Config.temperature) { $script:Config.temperature } else { 'model default' }))
     Write-Host ("  Max tokens:   {0}" -f $(if ($script:Config.maxTokens) { $script:Config.maxTokens } else { 'model default' }))
     $unsup = @((Get-UnsupportedParams).Keys)
@@ -2524,6 +2783,14 @@ function Invoke-SlashCommand([string]$Name, [string]$Arg) {
             }
         }
         '/revert' { Invoke-Revert }
+        '/permissions' { Invoke-PermissionsCommand $Arg }
+        '/compact' { Invoke-Compact $Arg }
+        '/init' {
+            if (-not $script:Config.tools -or $script:Config.readOnly) { Write-Warn '/init needs the model to write a file; turn tools on with /tools on.'; break }
+            Write-Host '> ' -NoNewline -ForegroundColor Cyan
+            Write-Dim '(asking the model to write USAI.md)'
+            Submit-Prompt $script:InitPrompt
+        }
         '/temperature' {
             if (-not $Arg) {
                 $t = if ($null -ne $script:Config.temperature) { $script:Config.temperature } else { 'model default' }
@@ -2643,6 +2910,10 @@ function Show-Banner {
     Write-Host "  model: $($script:CurrentModel)" -ForegroundColor DarkGray
     Write-Host "  cwd:   $((Get-Location).ProviderPath)" -ForegroundColor DarkGray
     Write-Host "  tools: $(Get-ToolsNote)" -ForegroundColor DarkGray
+    $instructionFiles = @(Get-InstructionFiles)
+    if ($instructionFiles.Count -gt 0) {
+        Write-Host "  instructions: $(@($instructionFiles | ForEach-Object { Get-DisplayPath $_ }) -join ', ')" -ForegroundColor DarkGray
+    }
     Write-Host ''
     Write-Dim '  /help for commands  -  @file to attach  -  Esc to interrupt'
     Write-Host ''
