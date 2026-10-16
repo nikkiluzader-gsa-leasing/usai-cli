@@ -169,6 +169,7 @@ You can also set the key with the `USAI_API_KEY` environment variable, which tak
 | `429` errors | You hit the rate limit (3 calls per second) or your weekly budget. The script retries rate limits on its own; a budget limit resets on Monday. |
 | `503` errors | That model is temporarily unavailable. The script retries twice; after that, try `/retry` later or switch with `/model`. |
 | A model rejects temperature, max tokens, streaming or tools | The script notices, drops that option for that model, and resends. `/context` shows what was dropped. |
+| An update or a change to `usai.ps1` seems to have no effect | Typing `usai` runs the installed copy in `~\.usai\bin`, not the file in the folder you're in. Run `.\usai.ps1 -Install` again after updating, or run `.\usai.ps1` directly to try a local copy. The banner warns when the folder's `usai.ps1` differs from the one running. |
 | Garbled characters | Use Windows Terminal, or a font with good Unicode coverage. |
 | Blocked as malicious content by antivirus | Let your IT or security team know; don't add an exclusion yourself. |
 

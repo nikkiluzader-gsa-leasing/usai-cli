@@ -999,7 +999,7 @@ You have tools for the user's working directory: list_files, read_file and searc
 - Read a file before changing it, and prefer edit_file for changes to existing files. old_string must match the file exactly, without the line numbers read_file adds.
 - The user sees a diff of every change and approves it, and approves every command. If the user declines, stop and ask what they would like instead.
 - Credential files (such as .clasprc.json and .env) can't be read or changed. Files in .git and .clasp.json can be read but not changed with edit_file or write_file; git and clasp commands still create and update them as usual (clasp clone and pull write .clasp.json, for example).
-- run_command runs in the working directory unless you pass dir, a subfolder to run in. Use dir for a clasp project in a subfolder: clasp clone writes into, and clasp status, pull and push act on, the folder they run in.
+- run_command runs in the working directory unless you pass dir, a subfolder to run in. Use dir for a clasp project in a subfolder: clasp clone writes into, and clasp status, pull and push act on, the folder they run in. To make a folder, write a file into it. The user can change the working directory with /cd <folder>.
 - Some commands and options are blocked. If a tool says something is blocked, first check whether an allowed way does the same thing (such as dir); otherwise tell the user the command so they can run it themselves. Do not look for a way around a block.
 - Only push, deploy or create versions when the user has asked for that in this conversation. Check status before pushing, and report the result.
 '@
@@ -2950,9 +2950,44 @@ function Show-Banner {
     if ($instructionFiles.Count -gt 0) {
         Write-Host "  instructions: $(@($instructionFiles | ForEach-Object { Get-DisplayPath $_ }) -join ', ')" -ForegroundColor DarkGray
     }
+    Show-CopyWarning
     Write-Host ''
     Write-Dim '  /help for commands  -  @file to attach  -  Esc to interrupt'
     Write-Host ''
+}
+
+# Typing "usai" runs the installed copy in ~\.usai\bin, not the usai.ps1 in the folder
+# you're editing, so a git pull or a local change seems to have no effect.
+function Show-CopyWarning {
+    if (-not $PSCommandPath) { return }
+    $here = Join-Path (Get-Location).ProviderPath 'usai.ps1'
+    if (-not (Test-Path -LiteralPath $here -PathType Leaf)) { return }
+    if ([IO.Path]::GetFullPath($here) -eq [IO.Path]::GetFullPath($PSCommandPath)) { return }
+    try {
+        # Compare text, not bytes: git may check the file out with different line endings.
+        $a = [IO.File]::ReadAllText($here).Replace("`r`n", "`n")
+        $b = [IO.File]::ReadAllText($PSCommandPath).Replace("`r`n", "`n")
+    }
+    catch { return }
+    if ($a -ceq $b) { return }
+    Write-Warn "  note:  this folder's usai.ps1 differs from the copy running now ($PSCommandPath)."
+    Write-Dim '         Use .\usai.ps1 to run this folder''s copy, or .\usai.ps1 -Install to update the installed one.'
+}
+
+# "cd testing" typed as a chat message: the model can't run shell commands, but /cd can.
+function Test-ShellLookalike([string]$Text) {
+    if ($Text -notmatch '^(cd|ls|dir|pwd|mkdir|md)(\s+\S+)?$') { return $false }
+    $cmd = $Matches[1]
+    $hint = switch ($cmd) {
+        { $_ -in 'cd' } { "/cd$($Text.Substring(2))" }
+        { $_ -in 'ls', 'dir' } { "/ls$($Text.Substring($cmd.Length))" }
+        'pwd' { '/pwd' }
+        default { $null }
+    }
+    if ($hint) { Write-Warn "That looks like a shell command; the model can't run those. Did you mean: $hint" }
+    else { Write-Warn "That looks like a shell command; the model can't run those. Ask it to create the folder (it writes a file inside), or run it in another PowerShell window." }
+    Write-Dim '  Not sent. To send it to the model anyway, rephrase it as a sentence.'
+    return $true
 }
 
 
@@ -3118,7 +3153,7 @@ function Start-Usai {
             Invoke-SlashCommand $name $arg
             if ($script:ExitRequested) { break }
         }
-        else {
+        elseif (-not (Test-ShellLookalike $trimmed)) {
             Submit-Prompt $trimmed
         }
         Write-Host ''
