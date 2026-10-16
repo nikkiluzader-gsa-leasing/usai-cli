@@ -139,11 +139,49 @@ Each time it wants to look at something, it tells you what and waits for your an
 - **a**: allow this kind of request for the rest of this session.
 - **n**: refuse. The model will stop and ask you what to do instead.
 
-It can **list** folders, **read** text files and **search** file contents. It can only see the current folder and the folders inside it, and it can't change, move or delete anything.
+It can **list** folders, **read** text files and **search** file contents. It can only see the current folder and the folders inside it, and it never reads files that hold passwords or sign-ins, such as `.clasprc.json` or `.env`.
 
-To turn this off, type `/tools off`. If you trust it in a folder and are tired of answering, `/approve on` stops the questions (use `/approve off` to bring them back).
+### Let it change files
 
-> Everything the model reads is sent to USAi, just like an attachment. Be careful with **a** and `/approve on` in folders that contain information you shouldn't share.
+Ask for a change, and the model can make it. Before anything is saved, you see what would change, removed lines in red and added lines in green:
+
+```
+> the onEdit trigger in Code.js logs twice, fix it
+  * edit_file Code.js
+      1   function onEdit(e) {
+      2 -   log(e);
+      3     log(e);
+      4   }
+    Save these changes to Code.js? [y]es  [n]o
+```
+
+Press **y** to save or **n** to refuse. Enter alone doesn't count, so you can't save a change by accident.
+
+Changed your mind afterwards? Type `/revert` to put the file back the way it was. Each `/revert` undoes one more change from this session. A copy of each original is also kept in `~\.usai\backups`.
+
+### Let it run git and clasp
+
+If you have `git` or Google's `clasp` installed, the model can run them for you, so you can ask for a whole job in one message:
+
+```
+> pull my Apps Script project, fix the date bug in Code.js, and push it
+```
+
+It runs `clasp pull`, reads the files, shows you the fix, and runs `clasp push`, asking you at each step:
+
+- Commands that only look, like `git status` or `clasp status`, ask **y** / **a** / **n**, like file reads.
+- Commands that change something, like `git commit` or `clasp pull`, need **y** each time.
+- `git push`, `clasp push`, and creating versions or deployments make you **type** `push` or `deploy`. `clasp push` replaces the live code that your sheets and forms run, so take a moment to check before you type it.
+
+Commands that could throw away work, like `git reset` or `git checkout`, are blocked, as are `clasp run`, `clasp login` and any program other than git and clasp. When something is blocked, the model tells you the command so you can run it yourself if you really want to.
+
+### Turning tools down or off
+
+- `/tools read` lets the model look at files but not change them or run commands.
+- `/tools off` turns tools off completely; `/tools on` turns everything back on.
+- `/approve on` stops the questions for reads and look-only commands (use `/approve off` to bring them back). File changes and other commands still ask.
+
+> Everything the model reads, and the output of every command it runs, is sent to USAi, just like an attachment. Be careful with **a** and `/approve on` in folders that contain information you shouldn't share.
 
 ## 6. Writing longer messages
 
@@ -253,7 +291,8 @@ PREVIOUS INPUT    Up arrow
 MODELS            /model   /model <part of name>   /models
 CONVERSATIONS     /clear   /resume   /retry   /undo   /copy   /export   /context
 FILES             /file <paths>   /drop   /cd <folder>   /ls   /pwd
-FILE ACCESS       /tools on|off   /approve on|off      (y / a / n when asked)
+TOOLS             /tools on|read|off   /approve on|off   /revert
+                  reads: y / a / n     changes: y / n    push/deploy: type the word
 SETTINGS          /system   /temperature   /max-tokens   /stream on|off
 KEY               /key reset
 HELP / QUIT       /help   /exit

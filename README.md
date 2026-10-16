@@ -1,6 +1,6 @@
 # USAi CLI
 
-Chat with [USAi](https://api.gsa.usai.gov) models from PowerShell. Replies stream in as they're written, you can attach files with `@`, and the model can (with your approval) read the files in your current folder to answer questions about them.
+Chat with [USAi](https://api.gsa.usai.gov) models from PowerShell. Replies stream in as they're written, you can attach files with `@`, and the model can (with your approval) read and edit the files in your current folder and run `git` and `clasp` commands for you.
 
 It's a single PowerShell script with no dependencies. It works in Windows PowerShell 5.1 and PowerShell 7+.
 
@@ -79,28 +79,45 @@ Attachments can be text files, images (png, jpg, gif, webp) or PDFs. Whether a m
 | `/temperature <0-1 \| default>` | Set response creativity |
 | `/max-tokens <n \| default>` | Limit reply length |
 | `/stream on\|off` | Turn streaming on or off |
-| `/tools on\|off` | Let the model read files in the current folder (see below) |
-| `/approve on\|off` | Skip the approval prompt for those reads |
+| `/tools on\|read\|off` | Let the model use files and git/clasp in the current folder; `read` means look only (see below) |
+| `/approve on\|off` | Skip the approval prompt for file reads and read-only commands |
+| `/revert` | Undo the last file change the model made (repeat to go further back) |
 | `/cd`, `/ls`, `/pwd` | Move around and look at folders without leaving the chat |
 | `/key reset` | Replace your saved API key |
 | `/help` | Show all commands |
 | `/exit` | Quit (also `/quit`) |
 
-## File tools
+## Tools
 
-When file tools are on (the default), the model can use three read-only tools to answer questions about your files:
+When tools are on (the default), the model can work with the files in your current folder, and with `git` and `clasp` if they're installed:
 
-- **list_files**: list a folder's contents
-- **read_file**: read a text file
-- **search_files**: search file contents
+| Tool | What it does | How you approve it |
+| --- | --- | --- |
+| **list_files**, **read_file**, **search_files** | Look at files | **y** (yes), **a** (always, for the rest of the session) or **n** (no) |
+| **edit_file**, **write_file** | Change or create a file | Shows a red/green diff first; press **y** to save. Enter alone doesn't count |
+| **run_command** | Run an allowed `git` or `clasp` subcommand | Read-only commands (`git status`, `clasp status`) ask y/a/n. Others (`git commit`, `clasp pull`) need **y** every time. `git push`, `clasp push` and deployments make you type `push` or `deploy` |
 
-Every request shows what the model wants to read and waits for you to answer **y** (yes), **a** (always allow this tool for the rest of the session), or **n** (no). The tools:
+So you can ask for a whole job, and approve each step as it goes:
 
-- only work inside the current folder and its subfolders (use `/cd` to change it)
-- can't change files or run commands
-- skip folders like `.git`, `node_modules`, `bin` and `obj` when searching
+```
+> pull my Apps Script project, fix the date bug in Code.js, and push it
+  * run_command clasp pull                         Run this command? [y]es [n]o
+  * read_file Code.js                              Allow? [y]es [a]lways [n]o
+  * edit_file Code.js        (diff shown)          Save these changes? [y]es [n]o
+  * run_command clasp push                         Type push to confirm
+```
 
-Models that don't support tool calling are detected automatically and just chat normally. Print mode (`-p`) never uses tools, since nobody is there to approve them.
+Limits, enforced by the script rather than by asking the model nicely:
+
+- Everything stays inside the current folder and its subfolders (use `/cd` to change it).
+- Credential files are never read or changed: `.clasprc.json` (your Google sign-in), `.env` files, `credentials.json`, keys and certificates, and USAi CLI's own `~\.usai` folder. Nothing inside `.git`, and not `.clasp.json`, can be edited either.
+- Only `git` and `clasp` can run, and only allowlisted subcommands. Commands start directly, never through a shell, so the model can't chain or redirect anything.
+- Blocked: `git reset`, `clean`, `checkout`, `restore`, `rm`, `rebase`, `config`, force pushes and branch deletion; `clasp run`, `login`, `logout`, `create`, `delete` and `--force`. The model is told why, so it can tell you the command to run yourself.
+- Commands that wait for typed input fail instead of hanging. Esc stops a running command, and any command is stopped after the request timeout (300 seconds).
+
+Before every file change, the original is copied to `~\.usai\backups`. `/revert` undoes the model's last change in this session; run it again to go further back.
+
+`/tools read` turns off editing and commands but keeps the three look-only tools. Models that don't support tool calling are detected automatically and just chat normally. Print mode (`-p`) never uses tools, since nobody is there to approve them.
 
 ## What gets sent where
 
@@ -109,7 +126,7 @@ The script only talks to `https://api.gsa.usai.gov`, using two endpoints:
 - `GET /api/v1/models` for the model list
 - `POST /api/v1/chat/completions` for everything else
 
-Each request includes the conversation so far, plus any files you attached and any file contents you approved the model reading. Nothing else leaves your machine.
+Each request includes the conversation so far, plus any files you attached, any file contents you approved the model reading, and the output of commands you approved. Nothing else leaves your machine, except what the `git` and `clasp` commands you approve send themselves (for example, `git push` to your git server and `clasp push` to Google).
 
 Stored locally in `~\.usai`:
 
@@ -118,6 +135,7 @@ Stored locally in `~\.usai`:
 | `api-key.xml` | Your API key, encrypted with Windows DPAPI (only your Windows account on this machine can read it) |
 | `config.json` | Your settings: default model, system prompt, temperature, and so on |
 | `sessions\*.json` | Saved conversations (images and PDFs are left out) |
+| `backups\*` | Copies of files from before the model changed them |
 | `bin\usai.ps1` | The installed copy of the script |
 
 You can also set the key with the `USAI_API_KEY` environment variable, which takes priority over the saved key.
@@ -140,7 +158,7 @@ You can also set the key with the `USAI_API_KEY` environment variable, which tak
 USAi's chat API follows the OpenAI Chat Completions format. The script:
 
 - streams replies as server-sent events, and falls back to a single JSON response when a model doesn't stream
-- uses the API's tool calling for the file tools, and sends back any provider-specific data a model includes with a tool request (Gemini models need this)
+- uses the API's tool calling for the tools, and sends back any provider-specific data a model includes with a tool request (Gemini models need this)
 - spaces requests out to stay under the rate limit, and retries brief outages (429, 503) with a short wait
 - uses `System.Net.Http.HttpClient` with explicit UTF-8, so accented letters and curly quotes come through correctly on Windows PowerShell 5.1
 

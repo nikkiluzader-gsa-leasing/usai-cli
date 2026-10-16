@@ -5,7 +5,9 @@
 .DESCRIPTION
     Interactive chat with streaming replies, @file mentions,
     multi-line paste, Esc to interrupt, saved/resumable conversations, and a
-    non-interactive print mode for scripting.
+    non-interactive print mode for scripting. With your approval, the model can
+    read and edit files in the current folder and run allowlisted git and clasp
+    commands.
 
     Works in Windows PowerShell 5.1 and PowerShell 7+.
 
@@ -61,6 +63,7 @@ $script:ConfigDir = Join-Path $HOME '.usai'
 $script:KeyFile = Join-Path $script:ConfigDir 'api-key.xml'
 $script:ConfigFile = Join-Path $script:ConfigDir 'config.json'
 $script:SessionDir = Join-Path $script:ConfigDir 'sessions'
+$script:BackupDir = Join-Path $script:ConfigDir 'backups'
 
 $script:DefaultModel = 'gpt_5_5_default_v2'
 $script:MaxFileChars = 120000        # per text file / command output
@@ -85,8 +88,9 @@ $script:Config = [ordered]@{
     stream       = $true
     systemPrompt = ''
     timeoutSec   = 300
-    tools        = $true     # let the model list/read/search files in the working folder
-    autoApprove  = $false    # skip the approval prompt for those reads
+    tools        = $true     # let the model use tools in the working folder
+    readOnly     = $false    # tools can only list/read/search: no edits or commands
+    autoApprove  = $false    # skip the approval prompt for reads and read-only commands
     temperature  = $null     # $null = model default
     maxTokens    = $null     # $null = model default
 }
@@ -103,6 +107,8 @@ $script:SpinVisible = $false
 $script:Md = $null
 $script:Unsupported = @{}      # model id -> options it rejected this session
 $script:ApprovedTools = @{}    # tools approved with "always" this session
+$script:EditLog = New-Object System.Collections.Generic.List[object]   # file changes /revert can undo
+$script:CommandPaths = $null   # program name -> full path, found on first use
 $script:LastRequestAt = $null
 
 $script:InputRedirected = $false
@@ -243,12 +249,12 @@ function Test-InterruptKey {
     return $false
 }
 
-function Show-Spinner($Stopwatch) {
+function Show-Spinner($Stopwatch, [string]$Label = 'Thinking...') {
     $frames = @('|', '/', '-', '\')
     $frame = $frames[$script:SpinIdx % 4]
     $script:SpinIdx++
     $secs = [int]$Stopwatch.Elapsed.TotalSeconds
-    Write-Host ("`r$frame Thinking... ${secs}s  (Esc to interrupt)") -NoNewline -ForegroundColor DarkGray
+    Write-Host ("`r$frame $Label ${secs}s  (Esc to interrupt)") -NoNewline -ForegroundColor DarkGray
     $script:SpinVisible = $true
 }
 
@@ -337,7 +343,7 @@ function Test-ToolsActive {
 function Get-SystemPrompt {
     $base = $script:DefaultSystemPrompt
     if ($script:Config.systemPrompt) { $base = [string]$script:Config.systemPrompt }
-    if (Test-ToolsActive) { $base += "`n" + $script:ToolsPrompt }
+    if (Test-ToolsActive) { $base += "`n" + (Get-ToolsPrompt) }
     $cwd = (Get-Location).ProviderPath
     return "$base`n`nEnvironment:`n- Today: $(Get-Date -Format 'dddd, MMMM d, yyyy')`n- Working directory: $cwd`n- Shell: PowerShell $($PSVersionTable.PSVersion)"
 }
@@ -371,7 +377,7 @@ function New-RequestBody([bool]$WithTools) {
         }
     }
     if ($WithTools -and (Test-ToolsActive)) {
-        $body.tools = $script:ToolDefs; $sent.Add('tools')
+        $body.tools = Get-ToolDefs; $sent.Add('tools')
     }
     return @{ Body = $body; Sent = $sent.ToArray() }
 }
@@ -926,16 +932,70 @@ function Add-PathsToPending([string]$ArgText) {
 }
 
 # ----------------------------------------------------------------------------
-# Tools: read-only file access the model can request (you approve each use)
+# Tools the model can request (you approve each use)
 # ----------------------------------------------------------------------------
 
 $script:SkipDirs = @('.git', 'node_modules', '.venv', 'venv', '__pycache__', '.vs', '.idea', 'bin', 'obj', 'dist', 'build', '.next', 'target')
-$script:ToolNames = @('list_files', 'read_file', 'search_files')
+$script:ReadToolNames = @('list_files', 'read_file', 'search_files')
 $script:MaxToolRounds = 20
+$script:MaxEditBytes = 2MB
+$script:MaxShownOutputLines = 12   # command output lines echoed to the screen
+$script:MaxShownDiffLines = 150
 
-$script:ToolsPrompt = @'
+# The tools never read or change these: they hold passwords, keys or sign-in tokens.
+$script:SecretPatterns = @(
+    '.clasprc.json', 'credentials.json', 'client_secret*.json', 'token.json',
+    '.env', '.env.*', '*.env', '.git-credentials', '.netrc', '_netrc', '.npmrc', '.pypirc',
+    '*.pem', '*.key', '*.pfx', '*.p12', 'id_rsa*', 'id_ecdsa*', 'id_ed25519*', 'api-key.xml'
+)
+
+$script:DeclinedText = 'The user declined this request. Do not retry it; ask the user how they would like to proceed.'
+
+$script:ReadOnlyToolsPrompt = @'
 You have read-only tools (list_files, read_file, search_files) for the user's working directory. When a question is about their files or code, use them to look instead of guessing, and read only what you need. You cannot change files or run commands; when changes are needed, show them. The user approves each tool use.
 '@
+
+$script:FullToolsPrompt = @'
+You have tools for the user's working directory: list_files, read_file and search_files to look at files, and edit_file and write_file to change them{0}. When a request is about their files or code, look instead of guessing, and read only what you need.
+- Read a file before changing it, and prefer edit_file for changes to existing files. old_string must match the file exactly, without the line numbers read_file adds.
+- The user sees a diff of every change and approves it, and approves every command. If the user declines, stop and ask what they would like instead.
+- Some files (credentials, anything in .git, .clasp.json) and some commands are blocked. If a tool says something is blocked, tell the user the command so they can run it themselves; do not look for a way around it.
+- Only push, deploy or create versions when the user has asked for that in this conversation. Check status before pushing, and report the result.
+'@
+
+# What run_command may run. Subcommands are "read" (asks; "always" allowed), "change"
+# (asks every time), or listed in "confirm" (the user types the word shown). Anything
+# else is blocked, as is any argument in "flags", in any position.
+$script:CommandRules = [ordered]@{
+    git   = @{
+        read    = @('status', 'diff', 'log', 'show', 'blame', 'ls-files', 'grep', 'describe', 'shortlog', 'rev-parse')
+        change  = @('add', 'commit', 'fetch', 'pull', 'switch', 'merge', 'mv', 'init')
+        special = @('branch', 'tag', 'stash', 'remote')   # depends on the arguments; see Get-GitRule
+        confirm = @{ push = 'push' }
+        flags   = @('--force', '-f', '--force-with-lease', '--force-if-includes', '--mirror', '--delete', '-d', '-D', '--hard',
+            '--no-index', '--output', '--upload-pack', '--receive-pack', '--exec', '--git-dir', '--work-tree', '--exec-path',
+            '-O', '--open-files-in-pager')
+        blocked = 'reset, clean, checkout, restore, rm, rebase, config, force pushes and deleting branches'
+    }
+    clasp = @{
+        read    = @('status', 'show-file-status', 'list', 'list-scripts', 'deployments', 'list-deployments', 'versions',
+            'list-versions', 'apis', 'list-apis', 'logs', 'tail-logs', 'show-authorized-user')
+        change  = @('pull', 'clone', 'clone-script')
+        special = @()
+        confirm = [ordered]@{
+            push = 'push'; version = 'deploy'; 'create-version' = 'deploy'; deploy = 'deploy'; 'create-deployment' = 'deploy'
+            redeploy = 'deploy'; 'update-deployment' = 'deploy'; undeploy = 'deploy'; 'delete-deployment' = 'deploy'
+        }
+        flags   = @('--auth', '-A', '--project', '-P', '--ignore', '-I', '--rootDir', '--watch', '-w', '--force', '-f')
+        blocked = 'run, login, logout, create, delete, enable-api, disable-api and --force'
+    }
+}
+
+$script:ConfirmNotes = @{
+    'git push'   = 'This sends your commits to the remote repository.'
+    'clasp push' = 'This replaces the code in the live Apps Script project with your local files.'
+    'clasp *'    = 'This changes the Apps Script project''s versions or deployments.'
+}
 
 function New-ToolDef([string]$Name, [string]$Description, [hashtable]$Properties, [string[]]$Required) {
     $params = @{ type = 'object'; properties = $Properties }
@@ -943,7 +1003,7 @@ function New-ToolDef([string]$Name, [string]$Description, [hashtable]$Properties
     return @{ type = 'function'; function = @{ name = $Name; description = $Description; parameters = $params } }
 }
 
-$script:ToolDefs = @(
+$script:ReadToolDefs = @(
     (New-ToolDef 'list_files' 'List files and folders in the user''s working directory or a subfolder. Read-only.' @{
             path      = @{ type = 'string'; description = 'Folder relative to the working directory. Default ".".' }
             pattern   = @{ type = 'string'; description = 'Wildcard filter for file names, e.g. "*.ps1". Default "*".' }
@@ -962,6 +1022,90 @@ $script:ToolDefs = @(
         } @('query'))
 )
 
+$script:EditToolDefs = @(
+    (New-ToolDef 'edit_file' 'Replace text in an existing file in the user''s working directory. The user sees a diff and must approve it.' @{
+            path        = @{ type = 'string'; description = 'File path relative to the working directory.' }
+            old_string  = @{ type = 'string'; description = 'Exact text to replace, copied from the file without read_file''s line numbers. Include enough surrounding lines that it matches only once.' }
+            new_string  = @{ type = 'string'; description = 'Text to put in its place.' }
+            replace_all = @{ type = 'boolean'; description = 'Replace every occurrence of old_string. Default false.' }
+        } @('path', 'old_string', 'new_string')),
+    (New-ToolDef 'write_file' 'Create a file, or replace all of an existing file''s contents, in the user''s working directory. Prefer edit_file for changes to existing files. The user sees a diff and must approve it.' @{
+            path    = @{ type = 'string'; description = 'File path relative to the working directory. Missing folders are created.' }
+            content = @{ type = 'string'; description = 'The complete new contents of the file.' }
+        } @('path', 'content'))
+)
+
+function New-RunCommandDef([string[]]$Programs) {
+    $lists = foreach ($p in $Programs) {
+        $r = $script:CommandRules[$p]
+        "${p}: " + ((@($r.read) + @($r.change) + @($r.special) + @($r.confirm.Keys)) -join ', ')
+    }
+    $blocked = foreach ($p in $Programs) { "${p}: $($script:CommandRules[$p].blocked)" }
+    $desc = "Run a $($Programs -join ' or ') command in the user's working directory (no shell, so no pipes, redirection or chaining). " +
+    "Allowed subcommands - $($lists -join '; '). Blocked - $($blocked -join '; '). " +
+    'Commands cannot read typed input or open an editor, so always pass -m to git commit. The user approves each command; pushes and deployments need extra confirmation.'
+    return (New-ToolDef 'run_command' $desc @{
+            program = @{ type = 'string'; enum = $Programs; description = 'The program to run.' }
+            args    = @{ type = 'array'; items = @{ type = 'string' }; description = 'Arguments after the program name, one per item. The first is the subcommand, e.g. ["commit", "-m", "Fix date parsing in onEdit"].' }
+        } @('program', 'args'))
+}
+
+function Get-ProgramPath([string]$Name) {
+    $isWindows = [IO.Path]::DirectorySeparatorChar -eq '\'
+    foreach ($c in @(Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue)) {
+        $path = [string]$c.Path
+        if (-not $path) { continue }
+        if ($isWindows -and [IO.Path]::GetExtension($path) -notin '.exe', '.cmd', '.bat', '.com') { continue }
+        return $path
+    }
+    return $null
+}
+
+# The programs run_command offers: the ones in CommandRules that are installed.
+function Get-CommandPrograms {
+    if ($null -eq $script:CommandPaths) {
+        $script:CommandPaths = [ordered]@{}
+        foreach ($name in $script:CommandRules.Keys) {
+            $path = Get-ProgramPath $name
+            if ($path) { $script:CommandPaths[$name] = $path }
+        }
+    }
+    return @($script:CommandPaths.Keys)
+}
+
+function Get-ToolDefs {
+    $defs = @($script:ReadToolDefs)
+    if (-not $script:Config.readOnly) {
+        $defs += $script:EditToolDefs
+        $programs = @(Get-CommandPrograms)
+        if ($programs.Count -gt 0) { $defs += New-RunCommandDef $programs }
+    }
+    return , $defs
+}
+
+function Get-ToolsPrompt {
+    if ($script:Config.readOnly) { return $script:ReadOnlyToolsPrompt }
+    $programs = @(Get-CommandPrograms)
+    $commands = ''
+    if ($programs.Count -gt 0) {
+        $commands = ", plus run_command to run $($programs -join ' and ') commands"
+        if ($programs -contains 'clasp') { $commands += ' (clasp is the Google Apps Script CLI)' }
+    }
+    return ($script:FullToolsPrompt -f $commands)
+}
+
+function Get-ToolsNote {
+    if (-not $script:Config.tools) { return 'off (/tools on)' }
+    if ($script:Config.readOnly) { $s = 'can read files here' }
+    else {
+        $s = 'can read and edit files here'
+        $programs = @(Get-CommandPrograms)
+        if ($programs.Count -gt 0) { $s += ' and run ' + ($programs -join '/') }
+    }
+    if ($script:Config.autoApprove) { return "$s, reads without asking" }
+    return "$s, asks first"
+}
+
 function Format-Size([long]$Bytes) {
     if ($Bytes -lt 1KB) { return "$Bytes B" }
     if ($Bytes -lt 1MB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
@@ -979,6 +1123,37 @@ function Resolve-ToolPath([string]$Path) {
         throw "Access denied: '$Path' is outside the working directory ($root). The user can /cd to another folder."
     }
     return $full
+}
+
+function Test-UnderFolder([string]$Path, [string]$Folder) {
+    $f = [IO.Path]::GetFullPath($Folder).TrimEnd('\', '/')
+    $p = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    return ($p -eq $f -or $p.StartsWith($f + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))
+}
+
+# Returns why a tool may not read (or, with -ForWrite, change) a path, or $null if it may.
+function Get-ProtectedReason([string]$FullPath, [switch]$ForWrite) {
+    if (Test-UnderFolder $FullPath $script:ConfigDir) {
+        return "it is in $($script:ConfigDir), where USAi CLI keeps your API key and settings"
+    }
+    $name = [IO.Path]::GetFileName($FullPath)
+    foreach ($p in $script:SecretPatterns) {
+        if ($name -like $p) { return "files named like $p can hold passwords, keys or sign-in tokens" }
+    }
+    if (-not $ForWrite) { return $null }
+
+    $root = (Get-Location).ProviderPath.TrimEnd('\', '/')
+    $rel = $FullPath.Substring([Math]::Min($root.Length, $FullPath.Length))
+    if (@($rel -split '[\\/]') -contains '.git') { return 'it is inside a .git folder (use git commands instead)' }
+    if ($name -eq '.clasp.json') { return '.clasp.json decides which Apps Script project clasp pushes to' }
+    # A link could point outside the working directory.
+    $p = $FullPath
+    while ($p -and $p.TrimEnd('\', '/').Length -gt $root.Length) {
+        $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.LinkType -in 'SymbolicLink', 'Junction') { return "'$(Get-DisplayPath $p)' is a link to another location" }
+        $p = Split-Path -Parent $p
+    }
+    return $null
 }
 
 function Get-ToolFiles([string]$Root, [string]$Pattern, [bool]$Recursive, [int]$Limit) {
@@ -1030,6 +1205,8 @@ function Invoke-ReadFile($A) {
     if (-not $A.path) { return 'Error: path is required.' }
     $full = Resolve-ToolPath ([string]$A.path)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return "Error: file '$($A.path)' not found." }
+    $why = Get-ProtectedReason $full
+    if ($why) { return "Error: reading '$($A.path)' is blocked because $why." }
     $fi = Get-Item -LiteralPath $full
     $ext = $fi.Extension.ToLowerInvariant()
     if ($script:ImageTypes.ContainsKey($ext) -or $ext -eq '.pdf' -or (Test-BinaryFile $full)) {
@@ -1069,9 +1246,11 @@ function Invoke-SearchFiles($A) {
     $files = @((Get-ToolFiles $full $glob $true 5000).Items | Where-Object { $_.Length -lt 2MB })
     $hits = New-Object System.Collections.Generic.List[string]
     $scanned = 0
+    $skipped = 0
     foreach ($f in $files) {
         $ext = $f.Extension.ToLowerInvariant()
         if ($script:ImageTypes.ContainsKey($ext) -or $ext -eq '.pdf') { continue }
+        if (Get-ProtectedReason $f.FullName) { $skipped++; continue }
         try { if (Test-BinaryFile $f.FullName) { continue } } catch { continue }
         $scanned++
         $ssParams = @{
@@ -1089,11 +1268,489 @@ function Invoke-SearchFiles($A) {
         }
         if ($hits.Count -ge 200) { break }
     }
-    if ($hits.Count -eq 0) { return "(no matches in $scanned files)" }
+    $note = if ($skipped) { "`n($skipped credential file(s) skipped)" } else { '' }
+    if ($hits.Count -eq 0) { return "(no matches in $scanned files)$note" }
     $text = $hits -join "`n"
     if ($hits.Count -ge 200) { $text += "`n(stopped at 200 matches; narrow the search)" }
-    return $text
+    return $text + $note
 }
+
+# ---- File changes ----------------------------------------------------------
+
+# Reads a UTF-8 text file for editing. Text uses `n line endings; Crlf and Bom
+# record how to write it back so untouched parts of the file stay the same.
+function Read-EditableFile([string]$Full, [string]$Shown) {
+    $fi = Get-Item -LiteralPath $Full -Force
+    if ($fi.Length -gt $script:MaxEditBytes) { throw "'$Shown' is too large to edit here ($(Format-Size $fi.Length))." }
+    $bytes = [IO.File]::ReadAllBytes($Full)
+    $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    if ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) {
+        throw "'$Shown' is saved as UTF-16; only UTF-8 text files can be edited."
+    }
+    if ([Array]::IndexOf($bytes, [byte]0) -ge 0) { throw "'$Shown' is a binary file and can't be edited." }
+    $start = if ($bom) { 3 } else { 0 }
+    try { $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes, $start, $bytes.Length - $start) }
+    catch { throw "'$Shown' isn't UTF-8 text (it may use an older Windows encoding), so it can't be edited safely." }
+    $crlf = ([regex]::Matches($text, "`r`n").Count * 2) -gt ([regex]::Matches($text, "`n").Count)
+    return @{ Text = $text.Replace("`r`n", "`n"); Bytes = $bytes; Bom = $bom; Crlf = $crlf }
+}
+
+function ConvertTo-FileBytes([string]$Text, [bool]$Bom, [bool]$Crlf) {
+    if ($Crlf) { $Text = $Text.Replace("`n", "`r`n") }
+    $body = (New-Object System.Text.UTF8Encoding $false).GetBytes($Text)
+    if (-not $Bom) { return , $body }
+    $out = New-Object byte[] ($body.Length + 3)
+    $out[0] = 0xEF; $out[1] = 0xBB; $out[2] = 0xBF
+    [Array]::Copy($body, 0, $out, 3, $body.Length)
+    return , $out
+}
+
+function Get-OccurrenceCount([string]$Text, [string]$Find) {
+    $n = 0
+    $i = $Text.IndexOf($Find, [StringComparison]::Ordinal)
+    while ($i -ge 0) {
+        $n++
+        $i = $Text.IndexOf($Find, $i + $Find.Length, [StringComparison]::Ordinal)
+    }
+    return $n
+}
+
+function Split-TextLines([string]$Text) {
+    if (-not $Text) { return , @() }
+    $lines = $Text.Split("`n")
+    if ($Text.EndsWith("`n")) { $lines = $lines[0..($lines.Count - 2)] }
+    return , @($lines)
+}
+
+# Line diff: a list of @{ Op = ' ' | '-' | '+'; Text; Line }, where Line is the
+# old line number for ' ' and '-' and the new line number for '+'.
+function Get-LineDiff([string]$OldText, [string]$NewText) {
+    $a = Split-TextLines $OldText
+    $b = Split-TextLines $NewText
+    $n = $a.Count; $m = $b.Count
+    $ops = New-Object System.Collections.Generic.List[object]
+
+    $pre = 0
+    while ($pre -lt $n -and $pre -lt $m -and $a[$pre] -ceq $b[$pre]) { $pre++ }
+    $suf = 0
+    while ($suf -lt ($n - $pre) -and $suf -lt ($m - $pre) -and $a[$n - 1 - $suf] -ceq $b[$m - 1 - $suf]) { $suf++ }
+    for ($i = 0; $i -lt $pre; $i++) { $ops.Add(@{ Op = ' '; Text = $a[$i]; Line = $i + 1 }) }
+
+    $x = $n - $pre - $suf; $y = $m - $pre - $suf
+    $i = 0; $j = 0
+    if ($x -gt 0 -and $y -gt 0 -and ($x * $y) -le 250000) {
+        # Longest common subsequence of the changed middle part.
+        $w = $y + 1
+        $dp = New-Object 'int[]' (($x + 1) * $w)
+        for ($p = $x - 1; $p -ge 0; $p--) {
+            for ($q = $y - 1; $q -ge 0; $q--) {
+                if ($a[$pre + $p] -ceq $b[$pre + $q]) { $dp[$p * $w + $q] = $dp[($p + 1) * $w + $q + 1] + 1 }
+                else {
+                    $down = $dp[($p + 1) * $w + $q]; $right = $dp[$p * $w + $q + 1]
+                    $dp[$p * $w + $q] = if ($down -ge $right) { $down } else { $right }
+                }
+            }
+        }
+        while ($i -lt $x -and $j -lt $y) {
+            if ($a[$pre + $i] -ceq $b[$pre + $j]) {
+                $ops.Add(@{ Op = ' '; Text = $a[$pre + $i]; Line = $pre + $i + 1 }); $i++; $j++
+            }
+            elseif ($dp[($i + 1) * $w + $j] -ge $dp[$i * $w + $j + 1]) {
+                $ops.Add(@{ Op = '-'; Text = $a[$pre + $i]; Line = $pre + $i + 1 }); $i++
+            }
+            else {
+                $ops.Add(@{ Op = '+'; Text = $b[$pre + $j]; Line = $pre + $j + 1 }); $j++
+            }
+        }
+    }
+    for (; $i -lt $x; $i++) { $ops.Add(@{ Op = '-'; Text = $a[$pre + $i]; Line = $pre + $i + 1 }) }
+    for (; $j -lt $y; $j++) { $ops.Add(@{ Op = '+'; Text = $b[$pre + $j]; Line = $pre + $j + 1 }) }
+    for ($k = 0; $k -lt $suf; $k++) { $ops.Add(@{ Op = ' '; Text = $a[$n - $suf + $k]; Line = $n - $suf + $k + 1 }) }
+    return , $ops
+}
+
+# Prints changed lines with 3 lines of context around them.
+function Show-Diff($Ops) {
+    $show = New-Object bool[] $Ops.Count
+    for ($i = 0; $i -lt $Ops.Count; $i++) {
+        if ($Ops[$i].Op -eq ' ') { continue }
+        for ($k = [Math]::Max(0, $i - 3); $k -le [Math]::Min($Ops.Count - 1, $i + 3); $k++) { $show[$k] = $true }
+    }
+    $printed = 0
+    $prev = -1
+    for ($i = 0; $i -lt $Ops.Count; $i++) {
+        if (-not $show[$i]) { continue }
+        if ($printed -ge $script:MaxShownDiffLines) {
+            $left = @($Ops | Select-Object -Skip $i | Where-Object { $_.Op -ne ' ' }).Count
+            if ($left) { Write-Dim "    ... ($left more changed lines not shown)" }
+            break
+        }
+        if ($prev -ge 0 -and $i -ne $prev + 1) { Write-Dim '    ...' }
+        $o = $Ops[$i]
+        $color = switch ($o.Op) { '-' { 'Red' } '+' { 'Green' } default { 'DarkGray' } }
+        Write-Host ('  {0,5} {1} {2}' -f $o.Line, $o.Op, $o.Text) -ForegroundColor $color
+        $printed++
+        $prev = $i
+    }
+}
+
+function Save-Backup([string]$Full, $Bytes) {
+    if ($null -eq $Bytes) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $script:BackupDir)) { New-Item -ItemType Directory -Path $script:BackupDir -Force | Out-Null }
+        $name = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [IO.Path]::GetFileName($Full)
+        [IO.File]::WriteAllBytes((Join-Path $script:BackupDir $name), $Bytes)
+    }
+    catch { Write-Dim "    (could not save a backup copy: $($_.Exception.Message))" }
+}
+
+# edit_file / write_file: work out the change, show the diff, and save only if the user says y.
+function Invoke-FileChange([string]$Name, $A) {
+    if (-not $A.path) { return 'Error: path is required.' }
+    $shown = [string]$A.path
+    $full = Resolve-ToolPath $shown
+    $why = Get-ProtectedReason $full -ForWrite
+    if ($why) { return "Error: changing '$shown' is blocked because $why. If it needs changing, tell the user what to change." }
+    if (Test-Path -LiteralPath $full -PathType Container) { return "Error: '$shown' is a folder." }
+    $exists = Test-Path -LiteralPath $full -PathType Leaf
+    $old = if ($exists) { Read-EditableFile $full $shown } else { $null }
+
+    if ($Name -eq 'write_file') {
+        if ($null -eq $A.content) { return 'Error: content is required.' }
+        $newText = ([string]$A.content).Replace("`r`n", "`n")
+    }
+    else {
+        if (-not $exists) { return "Error: file '$shown' not found. Use write_file to create a new file." }
+        $find = ([string]$A.old_string).Replace("`r`n", "`n")
+        $replace = ([string]$A.new_string).Replace("`r`n", "`n")
+        if (-not $find) { return 'Error: old_string is required.' }
+        $count = Get-OccurrenceCount $old.Text $find
+        if ($count -eq 0) {
+            return "Error: old_string was not found in '$shown'. It must match the file exactly, including spaces and indentation, and without the line numbers read_file adds. Read the file again and retry."
+        }
+        if ($count -gt 1 -and -not $A.replace_all) {
+            return "Error: old_string appears $count times in '$shown'. Include more surrounding lines so it matches once, or set replace_all to true."
+        }
+        $newText = $old.Text.Replace($find, $replace)
+    }
+
+    $oldText = if ($exists) { $old.Text } else { '' }
+    if ($exists -and $newText -ceq $oldText) { return "No change needed: '$shown' already has that content." }
+
+    $ops = Get-LineDiff $oldText $newText
+    $added = @($ops | Where-Object { $_.Op -eq '+' }).Count
+    $removed = @($ops | Where-Object { $_.Op -eq '-' }).Count
+    Show-Diff $ops
+    $question = if ($exists) { "Save these changes to ${shown}?" } else { "Create ${shown}?" }
+    if (-not (Read-YesNo $question)) { return $script:DeclinedText }
+
+    $bytes = ConvertTo-FileBytes $newText ($exists -and $old.Bom) ($exists -and $old.Crlf)
+    $before = if ($exists) { $old.Bytes } else { $null }
+    Save-Backup $full $before
+    $dir = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [IO.File]::WriteAllBytes($full, $bytes)
+    $script:EditLog.Add(@{ Path = $full; Before = $before; After = $bytes })
+
+    if ($exists) { return "Saved $shown ($added line(s) added, $removed removed)." }
+    return "Created $shown ($added line(s))."
+}
+
+function Invoke-Revert {
+    if ($script:EditLog.Count -eq 0) { Write-Warn 'No file changes to revert in this session.'; return }
+    $e = $script:EditLog[$script:EditLog.Count - 1]
+    $shown = Get-DisplayPath $e.Path
+    $current = $null
+    if (Test-Path -LiteralPath $e.Path -PathType Leaf) { $current = [IO.File]::ReadAllBytes($e.Path) }
+    $unchanged = ($null -ne $current) -and ([Convert]::ToBase64String($current) -eq [Convert]::ToBase64String($e.After))
+    if (-not $unchanged) {
+        Write-Warn "$shown has changed since the model saved it (maybe by you or a command like clasp pull)."
+        if (-not (Read-YesNo 'Revert to the version from before the model''s change anyway?')) { return }
+    }
+    try {
+        if ($null -eq $e.Before) {
+            if ($null -ne $current) { Remove-Item -LiteralPath $e.Path -Force }
+            Write-Ok "Deleted $shown (the model had created it)."
+        }
+        else {
+            [IO.File]::WriteAllBytes($e.Path, $e.Before)
+            Write-Ok "Restored $shown to how it was before the model's last change."
+        }
+    }
+    catch { Write-Err "Could not revert ${shown}: $($_.Exception.Message)"; return }
+    $script:EditLog.RemoveAt($script:EditLog.Count - 1)
+    # Tell the model with the next message, so it doesn't assume its change is still there.
+    $script:Pending.Add(@{ Label = "revert of $shown"; Kind = 'text'; Text = "[Note: the user reverted your last change to $shown. The file is back to how it was before that change.]" })
+    if ($script:EditLog.Count -gt 0) { Write-Dim "  $($script:EditLog.Count) earlier change(s) can still be reverted with /revert." }
+}
+
+# ---- Commands --------------------------------------------------------------
+
+# git's rules for subcommands that only read with some arguments.
+function Get-GitRule([string]$Sub, [string[]]$Rest) {
+    $first = if ($Rest.Count -gt 0) { $Rest[0] } else { '' }
+    switch -CaseSensitive ($Sub) {
+        'branch' {
+            $listing = @('-a', '--all', '-r', '--remotes', '-v', '-vv', '--verbose', '--list', '--show-current', '--no-color')
+            if (@($Rest | Where-Object { $listing -cnotcontains $_ }).Count -eq 0) { return @{ Level = 'read' } }
+            return @{ Level = 'change' }
+        }
+        'tag' {
+            if ($Rest.Count -eq 0 -or $first -in '-l', '--list') { return @{ Level = 'read' } }
+            return @{ Level = 'change' }
+        }
+        'stash' {
+            if ($first -in 'list', 'show') { return @{ Level = 'read' } }
+            if ($Rest.Count -eq 0 -or $first -in 'push', 'pop', 'apply', 'save') { return @{ Level = 'change' } }
+            return @{ Error = "'git stash $first' is blocked because it can discard stashed work." }
+        }
+        'remote' {
+            if ($first -in 'show', 'get-url' -or @($Rest | Where-Object { $_ -notin '-v', '--verbose' }).Count -eq 0) { return @{ Level = 'read' } }
+            return @{ Error = 'changing git remotes is blocked; the user can do that themselves.' }
+        }
+        { $_ -in 'push', 'fetch', 'pull' } {
+            foreach ($arg in $Rest) {
+                if ($arg -match '^[+:]') { return @{ Error = "the refspec '$arg' is blocked because it force-updates or deletes a branch." } }
+            }
+            if ($Sub -eq 'push' -and @($Rest | Where-Object { $_ -like '--prune*' }).Count -gt 0) {
+                return @{ Error = "'git push --prune' is blocked because it deletes remote branches." }
+            }
+        }
+    }
+    return $null
+}
+
+# Decides whether a command may run. Returns @{ Level = 'read'|'change'|'confirm'; Word } or @{ Error }.
+function Get-CommandRule([string]$Program, [string[]]$Arguments) {
+    $rules = $script:CommandRules[$Program]
+    if ($Arguments.Count -eq 0 -or $Arguments[0].StartsWith('-')) {
+        return @{ Error = "the first argument must be a $Program subcommand, e.g. [""status""]." }
+    }
+    $sub = $Arguments[0]
+    $rest = @($Arguments | Select-Object -Skip 1)
+
+    foreach ($arg in $rest) {
+        $optName = ($arg -split '=', 2)[0]
+        foreach ($f in $rules.flags) {
+            $hit = $arg -ceq $f
+            if ($f.StartsWith('--')) {
+                # git accepts any unambiguous abbreviation of a long option (--forc means --force).
+                $hit = $hit -or ($optName.Length -gt 2 -and $optName.StartsWith('--') -and $f.StartsWith($optName, [StringComparison]::Ordinal))
+            }
+            elseif (-not $arg.StartsWith('--') -and $arg -cmatch "^-[A-Za-z]*$($f[1])") {
+                $hit = $true   # combined short options, e.g. -fq
+            }
+            if ($hit) { return @{ Error = "the option '$arg' is blocked ($Program $sub $f)." } }
+        }
+    }
+
+    if ($Program -eq 'git') {
+        $special = Get-GitRule $sub $rest
+        if ($special) { return $special }
+    }
+    if ($rules.read -ccontains $sub) { return @{ Level = 'read' } }
+    if ($rules.change -ccontains $sub) { return @{ Level = 'change' } }
+    if (@($rules.confirm.Keys) -ccontains $sub) { return @{ Level = 'confirm'; Word = $rules.confirm[$sub] } }
+    $allowed = (@($rules.read) + @($rules.change) + @($rules.special) + @($rules.confirm.Keys)) -join ', '
+    return @{ Error = "'$Program $sub' is not on the allowed list. Allowed: $allowed." }
+}
+
+# Windows command-line quoting, as CommandLineToArgvW and most programs parse it.
+function ConvertTo-ProcessArg([string]$Arg) {
+    if ($Arg.Length -gt 0 -and $Arg -notmatch '[\s"]') { return $Arg }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $slashes = 0
+    foreach ($ch in $Arg.ToCharArray()) {
+        if ($ch -eq [char]'\') { $slashes++; continue }
+        if ($ch -eq [char]'"') { [void]$sb.Append([char]'\', 2 * $slashes + 1) }
+        elseif ($slashes -gt 0) { [void]$sb.Append([char]'\', $slashes) }
+        $slashes = 0
+        [void]$sb.Append($ch)
+    }
+    [void]$sb.Append([char]'\', 2 * $slashes)
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+# npm installs clasp on Windows as clasp.cmd, a wrapper that runs a .js file with node.
+# Running node directly keeps cmd.exe from interpreting characters like & | % in arguments.
+function Get-NodeShimTarget([string]$CmdPath) {
+    try { $text = [IO.File]::ReadAllText($CmdPath) } catch { return $null }
+    $m = [regex]::Match($text, '"%dp0%\\([^"%]+\.[cm]?js)"')
+    if (-not $m.Success) { return $null }
+    $dir = Split-Path -Parent $CmdPath
+    $js = Join-Path $dir $m.Groups[1].Value
+    if (-not (Test-Path -LiteralPath $js -PathType Leaf)) { return $null }
+    $node = Join-Path $dir 'node.exe'
+    if (-not (Test-Path -LiteralPath $node -PathType Leaf)) { $node = Get-ProgramPath 'node' }
+    if (-not $node) { return $null }
+    return @{ Node = $node; Script = $js }
+}
+
+function New-CommandStartInfo([string]$Path, [string[]]$Arguments) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
+    $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding $false
+    $psi.WorkingDirectory = (Get-Location).ProviderPath
+    # Fail instead of waiting for input nobody can type: credential prompts, editors, pagers.
+    $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    $psi.EnvironmentVariables['GIT_EDITOR'] = ':'
+    $psi.EnvironmentVariables['GIT_SEQUENCE_EDITOR'] = ':'
+    $psi.EnvironmentVariables['GIT_PAGER'] = 'cat'
+    $psi.EnvironmentVariables['PAGER'] = 'cat'
+    $psi.EnvironmentVariables['NO_COLOR'] = '1'
+    $psi.EnvironmentVariables['FORCE_COLOR'] = '0'
+
+    $exe = $Path
+    $all = @($Arguments)
+    if ($Path -match '\.(cmd|bat)$') {
+        $shim = Get-NodeShimTarget $Path
+        if ($shim) {
+            $exe = $shim.Node
+            $all = @($shim.Script) + @($Arguments)
+        }
+        else {
+            # Not a wrapper we recognize: run it through cmd.exe, refusing characters cmd.exe treats specially.
+            foreach ($arg in $Arguments) {
+                if ($arg -match '["%!^&|<>()\r\n]') { throw "the argument '$arg' contains characters that can't be passed safely to $([IO.Path]::GetFileName($Path))." }
+            }
+            $quoted = foreach ($x in (@($Path) + @($Arguments))) { if ($x -match '\s' -or -not $x) { "`"$x`"" } else { $x } }
+            $psi.FileName = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+            $psi.Arguments = '/d /s /c "' + ($quoted -join ' ') + '"'
+            return $psi
+        }
+    }
+    $psi.FileName = $exe
+    if ($psi | Get-Member -Name ArgumentList) {
+        foreach ($x in $all) { $psi.ArgumentList.Add($x) }   # PowerShell 7: no quoting needed
+    }
+    else {
+        $psi.Arguments = (@($all | ForEach-Object { ConvertTo-ProcessArg $_ }) -join ' ')
+    }
+    return $psi
+}
+
+function Stop-ProcessTree($Proc) {
+    try { $Proc.Kill($true); return } catch { }   # .NET Core can kill child processes too
+    if ([IO.Path]::DirectorySeparatorChar -eq '\') {
+        try { & (Join-Path ([Environment]::SystemDirectory) 'taskkill.exe') /T /F /PID $Proc.Id 2>&1 | Out-Null } catch { }
+    }
+    try { if (-not $Proc.HasExited) { $Proc.Kill() } } catch { }
+}
+
+# Removes color codes, and keeps only the final state of lines redrawn with carriage returns (spinners).
+function Format-CommandOutput([string]$Text) {
+    $t = [regex]::Replace($Text, "$([char]27)\[[0-9;?]*[ -/]*[@-~]", '')
+    $lines = foreach ($line in $t.Replace("`r`n", "`n").Split("`n")) {
+        $parts = @($line.Split("`r") | Where-Object { $_ -ne '' })
+        if ($parts.Count -gt 0) { $parts[$parts.Count - 1] } else { '' }
+    }
+    return ($lines -join "`n").Trim()
+}
+
+# Runs a program without a shell, stopping it on Esc or after the timeout.
+function Invoke-ExternalCommand($StartInfo) {
+    $result = @{ ExitCode = $null; Output = ''; Stopped = '' }
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $StartInfo
+    $oldCtrlC = $null
+    if (-not $script:InputRedirected) {
+        try { $oldCtrlC = [Console]::TreatControlCAsInput; [Console]::TreatControlCAsInput = $true } catch { $oldCtrlC = $null }
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        [void]$proc.Start()
+        $proc.StandardInput.Close()   # prompts get end-of-input instead of waiting forever
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        while (-not $proc.WaitForExit(100)) {
+            if (Test-InterruptKey) { $result.Stopped = 'stopped by the user'; break }
+            if ($sw.Elapsed.TotalSeconds -ge [int]$script:Config.timeoutSec) { $result.Stopped = "stopped after $($script:Config.timeoutSec)s with no result"; break }
+            if (-not $script:OutputRedirected -and $sw.Elapsed.TotalSeconds -ge 1) { Show-Spinner $sw 'Running...' }
+        }
+        if ($result.Stopped) { Stop-ProcessTree $proc }
+        else { $proc.WaitForExit(); $result.ExitCode = $proc.ExitCode }
+        [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000)
+        $text = ''
+        if ($outTask.IsCompleted -and -not $outTask.IsFaulted) { $text += $outTask.Result }
+        if ($errTask.IsCompleted -and -not $errTask.IsFaulted -and $errTask.Result) {
+            if ($text -and -not $text.EndsWith("`n")) { $text += "`n" }
+            $text += $errTask.Result
+        }
+        $result.Output = Format-CommandOutput $text
+    }
+    finally {
+        $sw.Stop()
+        Clear-Spinner
+        if ($null -ne $oldCtrlC) { try { [Console]::TreatControlCAsInput = $oldCtrlC } catch { } }
+        $proc.Dispose()
+    }
+    return $result
+}
+
+function Get-CommandArgs($A) {
+    if ($A.args -is [string]) { return , @(Split-Arguments $A.args) }
+    return , @(@($A.args) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+}
+
+function Format-CommandLine([string]$Program, [string[]]$Arguments) {
+    $shown = foreach ($x in $Arguments) { if ($x -match '[\s"]' -or -not $x) { '"' + $x.Replace('"', '\"') + '"' } else { $x } }
+    return (@($Program) + @($shown)) -join ' '
+}
+
+function Invoke-RunCommand($A) {
+    $program = [string]$A.program
+    $arguments = Get-CommandArgs $A
+    if (-not $script:CommandRules.Contains($program)) {
+        return "Error: running '$program' is blocked. Only $(@($script:CommandRules.Keys) -join ' and ') commands can be run."
+    }
+    $programs = Get-CommandPrograms
+    if ($programs -notcontains $program) { return "Error: $program isn't installed on this computer (it isn't on the PATH)." }
+    $rule = Get-CommandRule $program $arguments
+    if ($rule.Error) { return "Error: $($rule.Error) Tell the user the command if they want to run it themselves." }
+    $path = $script:CommandPaths[$program]
+    if (Test-UnderFolder $path (Get-Location).ProviderPath) {
+        return "Error: blocked because the $program found on the PATH ($path) is inside the working directory."
+    }
+
+    $startInfo = New-CommandStartInfo $path $arguments   # throws if an argument can't be passed safely
+
+    $sub = $arguments[0]
+    $ok = switch ($rule.Level) {
+        'read' { Request-ToolApproval "$program $sub" "$program $sub" }
+        'change' { Read-YesNo 'Run this command?' }
+        'confirm' {
+            $note = $script:ConfirmNotes["$program $sub"]
+            if (-not $note) { $note = $script:ConfirmNotes["$program *"] }
+            Read-ConfirmWord $rule.Word $note
+        }
+    }
+    if (-not $ok) { return $script:DeclinedText }
+
+    $r = Invoke-ExternalCommand $startInfo
+    $out = $r.Output
+    if ($out) {
+        $lines = $out.Split("`n")
+        foreach ($l in ($lines | Select-Object -First $script:MaxShownOutputLines)) { Write-Dim "    | $l" }
+        if ($lines.Count -gt $script:MaxShownOutputLines) { Write-Dim "    | ... ($($lines.Count - $script:MaxShownOutputLines) more lines)" }
+    }
+    if ($r.Stopped) { Write-Warn "    -> $($r.Stopped)" }
+    elseif ($r.ExitCode -eq 0) { Write-Dim '    -> done (exit code 0)' }
+    else { Write-Warn "    -> failed (exit code $($r.ExitCode))" }
+
+    if ($out.Length -gt $script:MaxFileChars) { $out = $out.Substring(0, $script:MaxFileChars) + "`n(output truncated)" }
+    if (-not $out) { $out = '(no output)' }
+    $status = if ($r.Stopped) { "The command was $($r.Stopped)." } else { "Exit code $($r.ExitCode)." }
+    return ('$ ' + (Format-CommandLine $program $arguments) + "`n$status`n$out")
+}
+
+# ---- Approval and dispatch -------------------------------------------------
 
 function Get-ToolSummary([string]$Name, $A) {
     switch ($Name) {
@@ -1114,16 +1771,20 @@ function Get-ToolSummary([string]$Name, $A) {
             if ($A.glob) { $s += " ($($A.glob))" }
             return $s
         }
+        'edit_file' { return [string]$A.path }
+        'write_file' { return [string]$A.path }
+        'run_command' { return (Format-CommandLine ([string]$A.program) (Get-CommandArgs $A)) }
     }
     return ''
 }
 
-function Request-ToolApproval([string]$Name) {
+# For reads: y / a (always) / n, and Enter means yes.
+function Request-ToolApproval([string]$Name, [string]$AlwaysLabel = 'this tool') {
     if ($script:Config.autoApprove -or $script:ApprovedTools.ContainsKey($Name)) { return $true }
     if ($script:InputRedirected) { return $false }
     while (Test-KeyAvailable) { [void][Console]::ReadKey($true) }   # ignore keys typed earlier
     Write-Host '    Allow? ' -NoNewline -ForegroundColor Yellow
-    Write-Host '[y]es  [a]lways for this tool  [n]o ' -NoNewline -ForegroundColor DarkGray
+    Write-Host "[y]es  [a]lways for $AlwaysLabel  [n]o " -NoNewline -ForegroundColor DarkGray
     while ($true) {
         $k = [Console]::ReadKey($true)
         $c = [string]$k.KeyChar
@@ -1133,7 +1794,33 @@ function Request-ToolApproval([string]$Name) {
     }
 }
 
-# Runs one tool call (after approval) and returns its text result for the model.
+# For changes: only y means yes; Enter alone doesn't count.
+function Read-YesNo([string]$Question) {
+    if ($script:InputRedirected) { return $false }
+    while (Test-KeyAvailable) { [void][Console]::ReadKey($true) }
+    Write-Host "    $Question " -NoNewline -ForegroundColor Yellow
+    Write-Host '[y]es  [n]o ' -NoNewline -ForegroundColor DarkGray
+    while ($true) {
+        $k = [Console]::ReadKey($true)
+        $c = [string]$k.KeyChar
+        if ($c -eq 'y') { Write-Host 'yes' -ForegroundColor Green; return $true }
+        if ($c -eq 'n' -or $k.Key -eq [ConsoleKey]::Escape) { Write-Host 'no' -ForegroundColor Red; return $false }
+    }
+}
+
+# For pushes and deployments: the user types the word.
+function Read-ConfirmWord([string]$Word, [string]$Note) {
+    if ($script:InputRedirected) { return $false }
+    while (Test-KeyAvailable) { [void][Console]::ReadKey($true) }
+    if ($Note) { Write-Warn "    $Note" }
+    Write-Host "    Type $Word to confirm, or press Enter to cancel: " -NoNewline -ForegroundColor Yellow
+    $typed = [Console]::ReadLine()
+    if ("$typed".Trim() -eq $Word) { return $true }
+    Write-Host '    Cancelled.' -ForegroundColor Red
+    return $false
+}
+
+# Runs one tool call (with the user's approval) and returns its text result for the model.
 function Invoke-ToolCall($Call) {
     $name = [string]$Call.function.name
     $raw = [string]$Call.function.arguments
@@ -1145,24 +1832,29 @@ function Invoke-ToolCall($Call) {
     Write-Host $name -NoNewline -ForegroundColor Magenta
     Write-Host (' ' + (Get-ToolSummary $name $a)) -ForegroundColor Gray
 
-    if ($script:ToolNames -notcontains $name) { return "Error: unknown tool '$name'. Available: $($script:ToolNames -join ', ')." }
-    if (-not (Request-ToolApproval $name)) {
-        return 'The user declined this request. Do not retry it; ask the user how they would like to proceed.'
-    }
+    $available = @((Get-ToolDefs) | ForEach-Object { $_.function.name })
+    if ($available -notcontains $name) { return "Error: unknown tool '$name'. Available: $($available -join ', ')." }
 
     try {
-        $out = switch ($name) {
-            'list_files' { Invoke-ListFiles $a }
-            'read_file' { Invoke-ReadFile $a }
-            'search_files' { Invoke-SearchFiles $a }
+        if ($script:ReadToolNames -contains $name) {
+            if (-not (Request-ToolApproval $name)) { return $script:DeclinedText }
+            $out = switch ($name) {
+                'list_files' { Invoke-ListFiles $a }
+                'read_file' { Invoke-ReadFile $a }
+                'search_files' { Invoke-SearchFiles $a }
+            }
         }
+        elseif ($name -eq 'run_command') { $out = Invoke-RunCommand $a }
+        else { $out = Invoke-FileChange $name $a }
         $out = [string]$out
     }
     catch { $out = "Error: $($_.Exception.Message)" }
     if (-not $out) { $out = '(no output)' }
 
+    if ($out -eq $script:DeclinedText) { return $out }
     if ($out.StartsWith('Error:')) { Write-Warn "    $out" }
-    else {
+    elseif ($name -in 'edit_file', 'write_file') { Write-Ok "    $out" }
+    elseif ($name -ne 'run_command') {
         $n = ($out -split "`n").Count
         Write-Dim ('    -> {0} line{1}' -f $n, $(if ($n -eq 1) { '' } else { 's' }))
     }
@@ -1482,8 +2174,9 @@ $script:Commands = [ordered]@{
     '/context' = 'Show conversation size and pending attachments'
     '/system'  = 'Show or set the system prompt: /system <text> | /system reset'
     '/stream'  = 'Turn streaming on or off: /stream on|off'
-    '/tools'   = 'Let the model list, read and search files in this folder: /tools on|off'
-    '/approve' = 'Skip the approval prompt for those file reads: /approve on|off'
+    '/tools'   = 'Let the model use files (and git/clasp) in this folder: /tools on|read|off'
+    '/approve' = 'Skip the approval prompt for file reads and read-only commands: /approve on|off'
+    '/revert'  = 'Undo the last file change the model made (repeat to go further back)'
     '/temperature' = 'Response creativity 0.0-1.0, or "default": /temperature 0.2'
     '/max-tokens'  = 'Maximum reply length in tokens, or "default": /max-tokens 4000'
     '/cd'      = 'Change directory'
@@ -1508,10 +2201,14 @@ function Show-Help {
     Write-Host '  Esc         Interrupt a response (Ctrl+C also works while a reply is running)'
     Write-Host '  Up-arrow    Recall previous input'
     Write-Host ''
-    Write-Host 'File tools' -ForegroundColor Cyan
-    Write-Host '  With /tools on, the model can list, read and search files under the current folder'
-    Write-Host '  to answer questions about them. It asks before each read ([y]es / [a]lways / [n]o),'
-    Write-Host '  cannot see outside this folder, and cannot change files or run anything.'
+    Write-Host 'Tools' -ForegroundColor Cyan
+    Write-Host '  With /tools on, the model can list, read and search files under the current folder,'
+    Write-Host '  edit them, and run allowlisted git and clasp commands. It asks before each step:'
+    Write-Host '    reads and read-only commands   [y]es / [a]lways / [n]o'
+    Write-Host '    file changes and commands      shows the diff or command; press y (Enter does not count)'
+    Write-Host '    git push, clasp push, deploys  type the word shown to confirm'
+    Write-Host '  It cannot leave this folder or touch credential files. /revert undoes a file change.'
+    Write-Host '  /tools read limits it to looking only.'
     Write-Host ''
     Write-Host 'Attachments: text files, images (png/jpg/gif/webp), and PDFs (model support varies).' -ForegroundColor DarkGray
     Write-Host 'Do not send sensitive, classified, or otherwise restricted data.' -ForegroundColor DarkGray
@@ -1721,8 +2418,9 @@ function Show-Context {
     Write-Host ("  Messages:     {0} ({1} exchanges)" -f $script:Messages.Count, $turns)
     Write-Host ("  Size:         ~{0:N0} tokens (estimate)" -f [int]($chars / 4))
     Write-Host ("  Streaming:    {0}" -f $(if ($script:StreamOn) { 'on' } else { 'off' }))
-    $toolState = if (-not $script:Config.tools) { 'off' } elseif (-not (Test-ToolsActive)) { 'not supported by this model' } elseif ($script:Config.autoApprove) { 'on (auto-approve)' } else { 'on (asks first)' }
-    Write-Host ("  File tools:   {0}" -f $toolState)
+    $toolState = if ($script:Config.tools -and -not (Test-ToolsActive)) { 'not supported by this model' } else { Get-ToolsNote }
+    Write-Host ("  Tools:        {0}" -f $toolState)
+    if ($script:EditLog.Count -gt 0) { Write-Host ("  File changes: {0} this session (/revert to undo)" -f $script:EditLog.Count) }
     Write-Host ("  Temperature:  {0}" -f $(if ($null -ne $script:Config.temperature) { $script:Config.temperature } else { 'model default' }))
     Write-Host ("  Max tokens:   {0}" -f $(if ($script:Config.maxTokens) { $script:Config.maxTokens } else { 'model default' }))
     $unsup = @((Get-UnsupportedParams).Keys)
@@ -1799,17 +2497,33 @@ function Invoke-SlashCommand([string]$Name, [string]$Arg) {
             Write-Ok "Streaming $Arg."
         }
         '/tools' {
-            Set-ConfigToggle 'tools' $Arg 'File tools'
+            if ($Arg -eq 'read') {
+                $script:Config.tools = $true
+                $script:Config.readOnly = $true
+                Save-Config
+                Write-Ok 'Tools on, read only: the model can look at files but not change them or run commands.'
+            }
+            elseif ($Arg -in 'on', 'off') {
+                if ($Arg -eq 'on') { $script:Config.readOnly = $false }
+                Set-ConfigToggle 'tools' $Arg 'Tools'
+                if ($Arg -eq 'on') { Write-Dim "  The model $(Get-ToolsNote)." }
+            }
+            else {
+                Write-Host "Tools: $(Get-ToolsNote). Use /tools on|read|off."
+                break
+            }
             if ($script:Config.tools -and (Get-UnsupportedParams).ContainsKey('tools')) {
                 Write-Warn "  $($script:CurrentModel) rejected tools earlier this session; switch models to use them."
             }
         }
         '/approve' {
-            Set-ConfigToggle 'autoApprove' $Arg 'Auto-approve file reads'
+            Set-ConfigToggle 'autoApprove' $Arg 'Auto-approve reads'
             if ($script:Config.autoApprove -and $Arg -eq 'on') {
-                Write-Dim '  The model can now read any file under the current folder without asking.'
+                Write-Dim '  The model can now read files under the current folder and run read-only commands'
+                Write-Dim '  (like git status) without asking. File changes and other commands still ask.'
             }
         }
+        '/revert' { Invoke-Revert }
         '/temperature' {
             if (-not $Arg) {
                 $t = if ($null -ne $script:Config.temperature) { $script:Config.temperature } else { 'model default' }
@@ -1928,8 +2642,7 @@ function Show-Banner {
     Write-Host '  chat in your terminal' -ForegroundColor DarkGray
     Write-Host "  model: $($script:CurrentModel)" -ForegroundColor DarkGray
     Write-Host "  cwd:   $((Get-Location).ProviderPath)" -ForegroundColor DarkGray
-    $toolNote = if (-not $script:Config.tools) { 'off (/tools on)' } elseif ($script:Config.autoApprove) { 'can read files here without asking' } else { 'can read files here, asks first' }
-    Write-Host "  tools: $toolNote" -ForegroundColor DarkGray
+    Write-Host "  tools: $(Get-ToolsNote)" -ForegroundColor DarkGray
     Write-Host ''
     Write-Dim '  /help for commands  -  @file to attach  -  Esc to interrupt'
     Write-Host ''
