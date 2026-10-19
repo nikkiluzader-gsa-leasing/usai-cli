@@ -81,7 +81,7 @@ Attachments can be text files, images (png, jpg, gif, webp) or PDFs. Whether a m
 | `/file <paths>` | Attach files to your next message (also `/add`; wildcards work) |
 | `/drop` | Discard attachments you haven't sent yet |
 | `/copy` | Copy the last reply to the clipboard |
-| `/export [full] [path]` | Save the conversation as Markdown, with one line per tool step and how it went. `full` adds each step's raw input, which can include file contents |
+| `/export [full\|brief] [path]` | Save the conversation as Markdown: what was said and when, each tool step's input and result (long ones cut at 4,000 characters), reply times and token counts, and the raw API response of any reply that came back empty or failed. `full` cuts nothing; `brief` gives one line per tool step. It can include file contents, so check it before sharing |
 | `/context` | Show conversation size, settings, and anything waiting to be sent |
 | `/system [text \| reset]` | Show or change the system prompt |
 | `/temperature <0-1 \| default>` | Set response creativity |

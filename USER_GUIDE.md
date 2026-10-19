@@ -258,7 +258,7 @@ Every conversation is saved automatically as you go.
 | Try the last answer again | `/retry` |
 | Take back your last question and its answer | `/undo` |
 | Copy the last answer to the clipboard | `/copy` |
-| Save the conversation as a document | `/export` (or `/export notes.md`). Each step the model took is one line, like `edit_file Code.js -> Saved`. `/export full` also includes what each step sent, which can include file contents, so don't share that version |
+| Save the conversation as a document | `/export` (or `/export notes.md`). It includes what each step the model took sent and got back, when each reply came and how many tokens it used, and the raw API response of any reply that came back empty or failed. Long inputs and results are cut at 4,000 characters; `/export full` keeps everything, and `/export brief` shows each step as one line, like `edit_file Code.js -> Saved`. Exports can include file contents, so check one before sharing it |
 | See how long the conversation is and your settings | `/context` |
 | Shrink a long conversation into a summary and keep going | `/compact` (or `/compact focus on the Code.js changes`) |
 

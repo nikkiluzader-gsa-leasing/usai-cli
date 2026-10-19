@@ -487,6 +487,7 @@ function Invoke-Completion {
     $result = @{
         Text = ''; Usage = $null; Error = $null; Body = $null; Status = 0; Cancelled = $false; Seconds = 0.0
         ToolCalls = (New-Object System.Collections.Generic.List[object]); FinishReason = ''; Sent = @()
+        Raw = ''; Headers = ''   # what came back, kept for the record when a reply is empty
     }
 
     $built = New-RequestBody $WithTools
@@ -524,6 +525,8 @@ function Invoke-Completion {
 
         $resp = $sendTask.Result
         $result.Status = [int]$resp.StatusCode
+        $result.Headers = (@($resp.Headers) + @($resp.Content.Headers) | Where-Object { $_.Key -notmatch '^set-cookie$' } |
+            ForEach-Object { "$($_.Key): $($_.Value -join ', ')" }) -join "`n"
 
         if (-not $resp.IsSuccessStatusCode) {
             $result.Error = "HTTP $($result.Status) $($resp.ReasonPhrase)"
@@ -542,6 +545,7 @@ function Invoke-Completion {
                 $result.Cancelled = $true
                 return $result
             }
+            $result.Raw = $readTask.Result
             try { $obj = $readTask.Result | ConvertFrom-Json }
             catch {
                 $result.Error = 'The API returned a response that is not valid JSON.'
@@ -578,6 +582,7 @@ function Invoke-Completion {
         else {
             # Server-sent events: "data: {...}" lines, ending with "data: [DONE]".
             $sb = New-Object System.Text.StringBuilder
+            $raw = New-Object System.Text.StringBuilder
             $calls = @{}
             $order = New-Object System.Collections.Generic.List[int]
             if (-not $Quiet) { Reset-Markdown }
@@ -593,6 +598,7 @@ function Invoke-Completion {
                 }
                 $line = $lineTask.Result
                 if ($null -eq $line) { break }
+                if ($raw.Length -lt 50000) { [void]$raw.AppendLine($line) }
                 if (-not $line.StartsWith('data:')) { continue }
 
                 $data = $line.Substring(5).Trim()
@@ -658,6 +664,7 @@ function Invoke-Completion {
             Clear-Spinner
             if (-not $Quiet) { Complete-Markdown }
             $result.Text = $sb.ToString()
+            $result.Raw = $raw.ToString()
 
             foreach ($k in $order) {
                 $c = $calls[$k]
@@ -2454,6 +2461,9 @@ function Save-Session {
                 if ($_.prompt) { $h.prompt = $_.prompt }
                 if ($_.tool_calls) { $h.tool_calls = @($_.tool_calls) }
                 if ($_.tool_call_id) { $h.tool_call_id = $_.tool_call_id }
+                if ($_.at) { $h.at = $_.at }
+                if ($_.meta) { $h.meta = $_.meta }
+                if ($_.record) { $h.record = @($_.record) }
                 $h
             })
         $data = [ordered]@{
@@ -2491,6 +2501,9 @@ function Import-Session([string]$Path) {
         if ($m.prompt) { $h.prompt = [string]$m.prompt }
         if ($m.tool_calls) { $h.tool_calls = @($m.tool_calls) }
         if ($m.tool_call_id) { $h.tool_call_id = [string]$m.tool_call_id }
+        if ($m.at) { $h.at = $m.at }
+        if ($m.meta) { $h.meta = $m.meta }
+        if ($m.record) { $h.record = @($m.record) }
         $list.Add($h)
     }
     $script:Messages = $list
@@ -2580,15 +2593,65 @@ function Get-ToolResultSummary([string]$Name, [string]$Result) {
     return ('{0} line{1}' -f $n, $(if ($n -eq 1) { '' } else { 's' }))
 }
 
-# /export writes a readable transcript: what was said, plus one line per tool step and how it went.
-# /export full also includes each tool call's raw arguments (file contents, edits, and so on).
+# Text in a Markdown code block, cut to $Cap characters (0 = no limit).
+function Format-Fenced([string]$Text, [int]$Cap) {
+    if ($Cap -gt 0 -and $Text.Length -gt $Cap) {
+        $Text = $Text.Substring(0, $Cap) + "`n... ($($Text.Length - $Cap) more characters; /export full keeps everything)"
+    }
+    $fence = '```'
+    while ($Text.Contains($fence)) { $fence += '`' }
+    return "$fence`n$($Text.TrimEnd())`n$fence"
+}
+
+function Format-ExportTime($At) {
+    try { return ([datetime]$At).ToString('HH:mm:ss') } catch { return '' }
+}
+
+function Format-ReplyMeta($Meta) {
+    if (-not $Meta) { return '' }
+    $parts = @()
+    $t = Format-ExportTime $Meta.at
+    if ($t) { $parts += $t }
+    if ($Meta.seconds) { $parts += ('{0:N1}s' -f [double]$Meta.seconds) }
+    if ($null -ne $Meta.in) { $parts += ('{0:N0} tokens in, {1:N0} out' -f [int]$Meta.in, [int]$Meta.out) }
+    if ($Meta.finish) { $parts += "finish: $($Meta.finish)" }
+    return ($parts -join ' - ')
+}
+
+# A tool call's arguments: short values on one line, long or multi-line ones (file contents, edits) in code blocks.
+function Format-ToolInput($A, [string]$RawArgs, [int]$Cap) {
+    $inline = @()
+    $blocks = @()
+    foreach ($p in @($A.PSObject.Properties)) {
+        $v = $p.Value
+        if ($v -is [string] -and ($v.Contains("`n") -or $v.Length -gt 120)) {
+            $blocks += "``$($p.Name)``:`n`n" + (Format-Fenced $v $Cap)
+        }
+        else {
+            $shown = if ($v -is [string]) { $v } else { ConvertTo-Json -InputObject $v -Depth 6 -Compress }
+            $inline += "``$($p.Name)``: $shown"
+        }
+    }
+    if ($inline.Count -eq 0 -and $blocks.Count -eq 0 -and $RawArgs.Trim() -and $RawArgs.Trim() -ne '{}') {
+        $blocks += Format-Fenced $RawArgs $Cap
+    }
+    $out = @()
+    if ($inline.Count -gt 0) { $out += ($inline -join ' - ') }
+    return (@($out) + $blocks) -join "`n`n"
+}
+
+# /export writes a readable transcript: what was said and when, each tool step with its input and
+# result, reply times and token counts, and the raw API response of any reply that came back empty
+# or failed. Long inputs and results are cut at 4,000 characters; /export full keeps everything, and
+# /export brief gives one line per tool step instead.
 function Export-Conversation([string]$Arg) {
     if ($script:Messages.Count -eq 0) { Write-Warn 'Nothing to export yet.'; return }
-    $withArgs = $false
+    $mode = 'normal'
     $Path = $Arg
-    if ($Arg -match '^full(?:\s+(.*))?$') { $withArgs = $true; $Path = [string]$Matches[1] }
+    if ($Arg -match '^(full|brief)(?:\s+(.*))?$') { $mode = $Matches[1]; $Path = [string]$Matches[2] }
     $Path = $Path.Trim().Trim('"')
     if (-not $Path) { $Path = 'usai-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.md' }
+    $cap = if ($mode -eq 'full') { 0 } else { 4000 }
 
     $results = @{}
     foreach ($m in $script:Messages) { if ($m.role -eq 'tool' -and $m.tool_call_id) { $results[[string]$m.tool_call_id] = [string]$m.content } }
@@ -2599,24 +2662,48 @@ function Export-Conversation([string]$Arg) {
     foreach ($m in $script:Messages) {
         if ($m.role -eq 'user') {
             $t = if ($m.prompt) { $m.prompt } else { ConvertTo-SavableContent $m.content }
-            [void]$sb.AppendLine('## You').AppendLine().AppendLine($t).AppendLine()
+            [void]$sb.AppendLine('## You').AppendLine()
+            $time = Format-ExportTime $m.at
+            if ($mode -ne 'brief' -and $time) { [void]$sb.AppendLine("_$($time)_").AppendLine() }
+            [void]$sb.AppendLine($t).AppendLine()
         }
         elseif ($m.role -eq 'assistant') {
-            if ($m.content) { [void]$sb.AppendLine('## Assistant').AppendLine().AppendLine([string]$m.content).AppendLine() }
             $steps = @($m.tool_calls | Where-Object { $_ })
+            if ($mode -eq 'brief') {
+                if ($m.content) { [void]$sb.AppendLine('## Assistant').AppendLine().AppendLine([string]$m.content).AppendLine() }
+            }
+            else {
+                [void]$sb.AppendLine('## Assistant').AppendLine()
+                $info = Format-ReplyMeta $m.meta
+                if ($info) { [void]$sb.AppendLine("_$($info)_").AppendLine() }
+                if ($m.content) { [void]$sb.AppendLine([string]$m.content).AppendLine() }
+            }
             foreach ($tc in $steps) {
                 $name = [string]$tc.function.name
+                $rawArgs = [string]$tc.function.arguments
                 $a = $null
-                try { $a = [string]$tc.function.arguments | ConvertFrom-Json } catch { }
+                try { $a = $rawArgs | ConvertFrom-Json } catch { }
                 if ($null -eq $a) { $a = New-Object PSObject }
                 $summary = (Get-ToolSummary $name $a) -replace '\s+', ' '
-                $outcome = Get-ToolResultSummary $name $results[[string]$tc.id]
-                [void]$sb.AppendLine("- **$name** $summary -> $outcome")
-                if ($withArgs) {
-                    [void]$sb.AppendLine().AppendLine('  ```json').AppendLine('  ' + [string]$tc.function.arguments).AppendLine('  ```')
+                $result = $results[[string]$tc.id]
+                $outcome = Get-ToolResultSummary $name $result
+                if ($mode -eq 'brief') { [void]$sb.AppendLine("- **$name** $summary -> $outcome"); continue }
+                [void]$sb.AppendLine("**$name** $summary -> $outcome").AppendLine()
+                [void]$sb.AppendLine('<details><summary>Input and result</summary>').AppendLine()
+                $inputText = Format-ToolInput $a $rawArgs $cap
+                if ($inputText) { [void]$sb.AppendLine($inputText).AppendLine() }
+                if ($null -ne $result) { [void]$sb.AppendLine('Result:').AppendLine().AppendLine((Format-Fenced $result $cap)).AppendLine() }
+                [void]$sb.AppendLine('</details>').AppendLine()
+            }
+            if ($mode -eq 'brief' -and $steps.Count -gt 0) { [void]$sb.AppendLine() }
+            if ($mode -ne 'brief') {
+                foreach ($rec in @($m.record | Where-Object { $_ })) {
+                    $what = ([string]$rec -split "`n")[0]
+                    [void]$sb.AppendLine("<details><summary>Raw API response: $what</summary>").AppendLine()
+                    [void]$sb.AppendLine((Format-Fenced ([string]$rec) 0)).AppendLine()
+                    [void]$sb.AppendLine('</details>').AppendLine()
                 }
             }
-            if ($steps.Count -gt 0) { [void]$sb.AppendLine() }
         }
     }
     try {
@@ -2646,6 +2733,36 @@ $script:MaxContinuations = 2   # times a reply cut off by the length limit is co
 $script:ContinuePrompt = 'Your last reply was cut off by the length limit. Continue exactly where it stopped, mid-sentence if need be, without repeating anything or adding an introduction.'
 $script:EmptyReplyPrompt = 'Your last reply came back empty. Carry on from where you left off: make the next tool call, or answer the user if the task is done.'
 
+# When a reply came back, how long it took, its token counts and why it stopped, for /export.
+function New-ReplyMeta($Result) {
+    $meta = @{ at = (Get-Date).ToString('o'); seconds = [Math]::Round($Result.Seconds, 1); finish = [string]$Result.FinishReason }
+    if ($Result.Usage -and $null -ne $Result.Usage.prompt_tokens) {
+        $meta.in = [int]$Result.Usage.prompt_tokens
+        $meta.out = [int]$Result.Usage.completion_tokens
+    }
+    return $meta
+}
+
+# Everything the API sent back for one request, as text: kept when a reply is empty or fails, so
+# /export shows exactly what came back.
+function Format-ApiResponse($Result, [string]$What) {
+    $finish = if ($Result.FinishReason) { $Result.FinishReason } else { '(none)' }
+    $lines = @(
+        "$What at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "model: $($script:CurrentModel)",
+        "HTTP status: $($Result.Status)",
+        ('time: {0:N1}s' -f $Result.Seconds),
+        "finish_reason: $finish",
+        ('conversation sent: ~{0:N0} tokens' -f [int]((Get-ContextChars) / 4))
+    )
+    if ($Result.Error) { $lines += "error: $($Result.Error)" }
+    if ($Result.Usage) { $lines += 'usage: ' + (ConvertTo-Json -InputObject $Result.Usage -Depth 5 -Compress) }
+    if ($Result.Headers) { $lines += '', 'response headers:', $Result.Headers }
+    $body = if ($Result.Raw) { $Result.Raw } elseif ($Result.Body) { $Result.Body } else { '(empty)' }
+    $lines += '', 'response body:', ([string]$body).TrimEnd()
+    return ($lines -join "`n")
+}
+
 function Add-TurnUsage($Usage, $Result) {
     $Usage.Seconds += $Result.Seconds
     if ($Result.Usage -and $null -ne $Result.Usage.prompt_tokens) {
@@ -2669,10 +2786,12 @@ function Invoke-Turn {
         Write-Host ''
         $r = Invoke-Request -WithTools $true
         Add-TurnUsage $usage $r
+        $record = @()   # raw API responses of empty or failed replies, kept with the message for /export
 
         # An empty reply is usually a one-off glitch, often after a long run of tool steps; ask once more before giving up.
         if (-not $r.Error -and -not $r.Cancelled -and $r.ToolCalls.Count -eq 0 -and -not $r.Text.Trim()) {
             Write-Dim '  (the model returned an empty response; asking again...)'
+            $record += Format-ApiResponse $r 'empty reply'
             $nudge = $script:Messages[$script:Messages.Count - 1].role -ne 'user'
             if ($nudge) { $script:Messages.Add(@{ role = 'user'; content = $script:EmptyReplyPrompt }) }
             try { $r = Invoke-Request -WithTools $true }
@@ -2697,7 +2816,8 @@ function Invoke-Turn {
             # Otherwise keep the steps already taken (files may have changed) and record the gap, so the
             # model knows what it did and /export shows what happened.
             $why = if ($r.Error) { "request failed: $($r.Error)" } else { 'the model returned an empty response' }
-            $script:Messages.Add(@{ role = 'assistant'; content = "(no reply: $why)" })
+            $record += Format-ApiResponse $r $(if ($r.Error) { 'failed request' } else { 'empty reply' })
+            $script:Messages.Add(@{ role = 'assistant'; content = "(no reply: $why)"; meta = (New-ReplyMeta $r); record = $record })
             Save-Session
             Write-Dim '  What happened so far is kept. Say "continue" to have it pick up where it stopped.'
             $tokens = [int]((Get-ContextChars) / 4)
@@ -2725,8 +2845,9 @@ function Invoke-Turn {
             if ($next.Cancelled) { Write-Warn 'Interrupted.'; $r.FinishReason = ''; $calls = @(); break }
         }
 
-        $msg = @{ role = 'assistant'; content = $r.Text }
+        $msg = @{ role = 'assistant'; content = $r.Text; meta = (New-ReplyMeta $r) }
         if ($calls.Count -gt 0) { $msg.tool_calls = $calls }
+        if ($record.Count -gt 0) { $msg.record = $record }
         $script:Messages.Add($msg)
         Show-FinishNote $r.FinishReason
 
@@ -2842,7 +2963,7 @@ function Submit-Prompt([string]$Prompt) {
     }
 
     $content = Build-UserContent $Prompt $attachments
-    $script:Messages.Add(@{ role = 'user'; content = $content; prompt = $Prompt })
+    $script:Messages.Add(@{ role = 'user'; content = $content; prompt = $Prompt; at = (Get-Date).ToString('o') })
     $script:Pending.Clear()
     if (-not $script:SessionTitle) {
         $script:SessionTitle = ($Prompt -replace '\s+', ' ').Trim()
@@ -2908,7 +3029,7 @@ $script:Commands = [ordered]@{
     '/retry'   = 'Resend the last failed message, or regenerate the last reply'
     '/undo'    = 'Remove the last exchange'
     '/copy'    = 'Copy the last reply to the clipboard'
-    '/export'  = 'Save the conversation as Markdown: /export [full] [path] (full adds each tool call''s raw input)'
+    '/export'  = 'Save the conversation as Markdown: /export [full|brief] [path] (full: nothing cut short; brief: one line per tool step)'
     '/context' = 'Show conversation size and pending attachments'
     '/system'  = 'Show or set the system prompt: /system <text> | /system reset'
     '/stream'  = 'Turn streaming on or off: /stream on|off'
