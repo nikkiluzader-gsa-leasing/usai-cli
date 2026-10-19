@@ -73,16 +73,17 @@ Attachments can be text files, images (png, jpg, gif, webp) or PDFs. Whether a m
 | `/file <paths>` | Attach files to your next message (also `/add`; wildcards work) |
 | `/drop` | Discard attachments you haven't sent yet |
 | `/copy` | Copy the last reply to the clipboard |
-| `/export [path]` | Save the conversation as Markdown |
+| `/export [full] [path]` | Save the conversation as Markdown, with one line per tool step and how it went. `full` adds each step's raw input, which can include file contents |
 | `/context` | Show conversation size, settings, and anything waiting to be sent |
 | `/system [text \| reset]` | Show or change the system prompt |
 | `/temperature <0-1 \| default>` | Set response creativity |
-| `/max-tokens <n \| default>` | Limit reply length |
+| `/max-tokens <n \| default>` | Limit reply length. A reply that hits the limit is continued automatically (up to twice) |
 | `/stream on\|off` | Turn streaming on or off |
 | `/tools on\|read\|off` | Let the model use files and git/clasp in the current folder; `read` means look only (see below) |
-| `/approve on\|off` | Skip the approval prompt for file reads and read-only commands |
-| `/revert` | Undo the last file change the model made (repeat to go further back) |
+| `/approve [ask\|reads\|edits\|all]` | Choose what runs without asking (see below). On its own, pick with the arrow keys |
+| `/revert` | Undo the last file change or delete the model made (repeat to go further back) |
 | `/permissions [remove <n> \| reset]` | Show or remove your "always" approvals |
+| `/clasp [filter]` | Pick one of your Apps Script projects with the arrow keys, then clone it into its own folder (or pull it, if it's already here). The model is told which project you picked |
 | `/compact [focus]` | Replace a long conversation with a summary, to save budget and keep the model focused |
 | `/init` | Have the model write a `USAI.md` with instructions for this folder (see below) |
 | `/cd`, `/ls`, `/pwd` | Move around and look at folders without leaving the chat |
@@ -97,16 +98,28 @@ When tools are on (the default), the model can work with the files in your curre
 | Tool | What it does | How you approve it |
 | --- | --- | --- |
 | **list_files**, **read_file**, **search_files** | Look at files | **y** or Enter |
-| **edit_file**, **write_file** | Change or create a file | Shows a red/green diff first, then **y** to save. Enter alone doesn't count |
+| **edit_file**, **write_file**, **delete_file** | Change, create or delete a file | Shows a red/green diff (or the file being deleted) first, then **y**. Enter alone doesn't count |
 | **run_command** | Run an allowed `git` or `clasp` subcommand | **y** for each command, or Enter for read-only ones like `git status`. `git push`, `clasp push` and deployments make you type `push` or `deploy` |
+| **ask_user** | Ask you to choose, e.g. which Apps Script project | Pick with the arrow keys, or choose "Type something else" |
 
 Instead of **y** you can also answer:
 
 - **a**: always allow this for the rest of the session
 - **f**: always allow this in the current folder and its subfolders. This one is saved, so it still applies next time you start `usai` here
-- **n**: no
+- **n**: no. You can then type what the model should do instead (or just press Enter), and it's passed on
 
-What "this" covers depends on the step: one read tool (`read_file`), **all file edits**, or one command (`git commit`, which doesn't cover `git add`). The diff is still shown for approved edits, and `/revert` still works. `git push`, `clasp push` and deployments can't be pre-approved; they ask for the word every time. **f** isn't offered in your home folder or at the top of a drive, where it would cover too much. `/permissions` lists what you've allowed and removes it.
+What "this" covers depends on the step: one read tool (`read_file`), **all file edits** (deletes included), or one command (`git commit`, which also covers `git add`). The diff is still shown for approved edits, and `/revert` still works. `git push`, `clasp push` and deployments can't be pre-approved; they ask for the word every time. **f** isn't offered in your home folder or at the top of a drive, where it would cover too much. `/permissions` lists what you've allowed and removes it.
+
+To stop being asked about whole kinds of steps, set a mode with `/approve` (it's saved, and shown before the `>` prompt):
+
+| Mode | Runs without asking |
+| --- | --- |
+| `ask` (default) | Nothing |
+| `reads` | Reading files and read-only commands like `git status` and `clasp list` |
+| `edits` | Also file changes. You still see each diff, and `/revert` undoes them |
+| `all` | Also commands like `git commit` and `clasp pull` |
+
+`git push`, `clasp push` and deployments ask for the word in every mode.
 
 So you can ask for a whole job, and approve each step as it goes:
 
@@ -127,9 +140,11 @@ Limits, enforced by the script rather than by asking the model nicely:
 - Blocked: `git reset`, `clean`, `checkout`, `restore`, `rm`, `rebase`, `config`, force pushes and branch deletion; `clasp run`, `login`, `logout`, `create`, `delete` and `--force`. The model is told why, so it can tell you the command to run yourself.
 - Commands that wait for typed input fail instead of hanging. Esc stops a running command, and any command is stopped after the request timeout (300 seconds).
 
-Before every file change, the original is copied to `~\.usai\backups`. `/revert` undoes the model's last change in this session; run it again to go further back. `write_file`, which replaces a whole file, only works on a file the model has read in this conversation and that hasn't changed since; otherwise it's told to read the file first.
+Before every file change or delete, the original is copied to `~\.usai\backups`. `/revert` undoes the model's last change in this session (bringing back a deleted file); run it again to go further back. To change a long block, the model can give a range of line numbers instead of copying the old text, but only right after reading the file, so the numbers can't be stale. `write_file`, which replaces a whole file, only works on a file the model has read in this conversation and that hasn't changed since; otherwise it's told to read the file first.
 
-`/tools read` turns off editing and commands but keeps the three look-only tools.
+A long job can take many steps. After 50 for one message, `usai` asks **Keep going?** so you can let it carry on without typing "continue".
+
+`/tools read` turns off editing and commands but keeps the three look-only tools (and **ask_user**).
 
 ## Project instructions (USAI.md)
 
