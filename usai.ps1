@@ -340,11 +340,50 @@ function Get-ApiErrorText($Body) {
     return $t
 }
 
+# read_file results whose lines a later read_file of the same file shows again, as id -> short note.
+# Reading a large file over and over can otherwise fill the model's context with copies of it.
+function Get-SupersededReads {
+    $results = @{}
+    foreach ($m in $script:Messages) { if ($m.role -eq 'tool' -and $m.tool_call_id) { $results[[string]$m.tool_call_id] = [string]$m.content } }
+    $reads = New-Object System.Collections.Generic.List[object]
+    foreach ($m in $script:Messages) {
+        if ($m.role -ne 'assistant' -or -not $m.tool_calls) { continue }
+        foreach ($tc in @($m.tool_calls | Where-Object { $_ })) {
+            if ([string]$tc.function.name -ne 'read_file') { continue }
+            $out = $results[[string]$tc.id]
+            if (-not $out) { continue }
+            if ($out -match '\(showing lines \d+-(\d+) of \d+; use offset to read more\)$') { $to = [int]$Matches[1] }
+            elseif ($out -match '\(end of file, (\d+) lines\)$') { $to = [int]$Matches[1] }
+            else { continue }
+            $a = $null
+            try { $a = [string]$tc.function.arguments | ConvertFrom-Json } catch { }
+            if (-not $a -or -not $a.path) { continue }
+            $from = if ($a.offset) { [Math]::Max(1, [int]$a.offset) } else { 1 }
+            $shown = ([string]$a.path).Trim() -replace '\\', '/' -replace '^\./', ''
+            $reads.Add(@{ Id = [string]$tc.id; Key = $shown.ToLowerInvariant(); Shown = $shown; From = $from; To = $to })
+        }
+    }
+    $superseded = @{}
+    for ($i = 0; $i -lt $reads.Count; $i++) {
+        $r = $reads[$i]
+        for ($j = $i + 1; $j -lt $reads.Count; $j++) {
+            $later = $reads[$j]
+            if ($later.Key -eq $r.Key -and $later.From -le $r.From -and $later.To -ge $r.To) {
+                $superseded[$r.Id] = "(lines $($r.From)-$($r.To) of $($r.Shown): read again later in this conversation, see that read)"
+                break
+            }
+        }
+    }
+    return $superseded
+}
+
 function Get-RequestMessages {
     $list = New-Object System.Collections.Generic.List[object]
     $list.Add(@{ role = 'system'; content = (Get-SystemPrompt) })
+    $superseded = Get-SupersededReads
     foreach ($m in $script:Messages) {
         $h = @{ role = $m.role; content = $m.content }
+        if ($m.tool_call_id -and $superseded.ContainsKey([string]$m.tool_call_id)) { $h.content = $superseded[[string]$m.tool_call_id] }
         if ($m.role -eq 'assistant' -and $m.tool_calls) {
             $h.tool_calls = @($m.tool_calls)
             if (-not $m.content) { $h.content = $null }
@@ -1032,6 +1071,7 @@ You have read-only tools (list_files, read_file, search_files) for the user's wo
 $script:FullToolsPrompt = @'
 You have tools for the user's working directory: list_files, read_file and search_files to look at files, edit_file, write_file and delete_file to change them{0}, and ask_user to have the user pick from options. When a request is about their files or code, look instead of guessing, and read only what you need.
 - Read files in large pieces (the default 500 lines is fine), and don't read a file again unless it has changed or you need a part you haven't seen.
+- Don't re-read code to double-check your edits: edit_file reports whether each change applied. To check one spot, use search_files or read just those lines. When the changes are done, stop and report to the user.
 - Read a file before changing it, and prefer edit_file for changes to existing files. old_string must match the file exactly, without the line numbers read_file adds. To replace or remove a long block, give start_line and end_line instead of old_string; line numbers must come from a read_file after the file's last change.
 - Depending on the user's settings, they may see a diff of each change and approve it, and approve commands. If the user declines, stop and ask what they would like instead, or follow what they said.
 - When the user needs to choose between options (for example, which Apps Script project to work on from clasp list), call ask_user with the options instead of listing them and waiting for a typed reply.
@@ -2604,6 +2644,7 @@ function Show-FinishNote([string]$Reason) {
 
 $script:MaxContinuations = 2   # times a reply cut off by the length limit is continued automatically
 $script:ContinuePrompt = 'Your last reply was cut off by the length limit. Continue exactly where it stopped, mid-sentence if need be, without repeating anything or adding an introduction.'
+$script:EmptyReplyPrompt = 'Your last reply came back empty. Carry on from where you left off: make the next tool call, or answer the user if the task is done.'
 
 function Add-TurnUsage($Usage, $Result) {
     $Usage.Seconds += $Result.Seconds
@@ -2629,6 +2670,16 @@ function Invoke-Turn {
         $r = Invoke-Request -WithTools $true
         Add-TurnUsage $usage $r
 
+        # An empty reply is usually a one-off glitch, often after a long run of tool steps; ask once more before giving up.
+        if (-not $r.Error -and -not $r.Cancelled -and $r.ToolCalls.Count -eq 0 -and -not $r.Text.Trim()) {
+            Write-Dim '  (the model returned an empty response; asking again...)'
+            $nudge = $script:Messages[$script:Messages.Count - 1].role -ne 'user'
+            if ($nudge) { $script:Messages.Add(@{ role = 'user'; content = $script:EmptyReplyPrompt }) }
+            try { $r = Invoke-Request -WithTools $true }
+            finally { if ($nudge) { $script:Messages.RemoveAt($script:Messages.Count - 1) } }
+            Add-TurnUsage $usage $r
+        }
+
         if ($r.Cancelled) {
             Write-Warn 'Interrupted.'
             if ($r.Text.Trim()) { $script:Messages.Add(@{ role = 'assistant'; content = $r.Text }) }
@@ -2640,9 +2691,20 @@ function Invoke-Turn {
 
         $calls = $r.ToolCalls.ToArray()
         if ($r.Error -or ($calls.Count -eq 0 -and -not $r.Text.Trim())) {
-            if ($r.Error) { Show-RequestError $r } else { Write-Warn 'The model returned an empty response.' }
-            if ($script:Messages.Count -gt $start) { $script:Messages.RemoveRange($start, $script:Messages.Count - $start) }
-            return $false
+            if ($r.Error) { Show-RequestError $r } else { Write-Warn 'The model returned an empty response again.' }
+            # Nothing done yet and the request failed: leave it out so /retry can resend the message.
+            if ($r.Error -and $script:Messages.Count -eq $start) { return $false }
+            # Otherwise keep the steps already taken (files may have changed) and record the gap, so the
+            # model knows what it did and /export shows what happened.
+            $why = if ($r.Error) { "request failed: $($r.Error)" } else { 'the model returned an empty response' }
+            $script:Messages.Add(@{ role = 'assistant'; content = "(no reply: $why)" })
+            Save-Session
+            Write-Dim '  What happened so far is kept. Say "continue" to have it pick up where it stopped.'
+            $tokens = [int]((Get-ContextChars) / 4)
+            if (-not $r.Error -and $tokens -ge 80000) {
+                Write-Dim ('  This conversation is ~{0:N0} tokens, which may be more than the model can take. /compact shrinks it.' -f $tokens)
+            }
+            return $true
         }
 
         # A reply cut off by the length limit: ask for the rest and join it on, so nobody has to type "continue".
@@ -2706,8 +2768,8 @@ function Show-LongConversationHint($Result) {
 }
 
 function Get-ContextChars {
-    $chars = (Get-SystemPrompt).Length
-    foreach ($m in $script:Messages) { $chars += (ConvertTo-SavableContent $m.content).Length }
+    $chars = 0
+    foreach ($m in Get-RequestMessages) { $chars += (ConvertTo-SavableContent $m.content).Length }
     return $chars
 }
 
