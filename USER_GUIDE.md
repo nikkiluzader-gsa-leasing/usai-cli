@@ -54,6 +54,8 @@ You only do this once.
 6. Type `usai` and press Enter.
 7. Paste your API key when asked (right-click pastes in most PowerShell windows), then press Enter. It's saved, encrypted, so you won't be asked again until you replace it.
 
+**Updating later:** type `usai -Update` in PowerShell, or `/update` while you're chatting. `usai` also tells you, at most once a day, when a newer version is available. (Running `usai -Install` again doesn't update; it just reinstalls the copy you already have.)
+
 **If step 4 says the script "cannot be loaded" or "is not digitally signed":** Windows has marked the downloaded file as untrusted. In File Explorer, right-click `usai.ps1`, choose **Properties**, tick **Unblock** near the bottom, and click **OK**. Then try step 4 again. If it still won't run, ask your IT team; don't try to work around the block.
 
 ## 3. Your first conversation
@@ -340,10 +342,11 @@ CONVERSATIONS     /clear   /resume   /retry   /undo   /copy   /export   /context
 FILES             /file <paths>   /drop   /cd <folder>   /ls   /pwd
 TOOLS             /tools on|read|off   /approve ask|reads|edits|all   /revert   /permissions
                   y yes   a always this session   f always in this folder   n no (then say what instead)
-APPS SCRIPT       /clasp   /clasp <part of name>
                   push/deploy: type the word, every time
+APPS SCRIPT       /clasp   /clasp <part of name>
 INSTRUCTIONS      USAI.md in a folder (or ~\.usai)   /init to write one
 SETTINGS          /system   /temperature   /max-tokens   /stream on|off
 KEY               /key reset
+UPDATE            usai -Update   or   /update
 HELP / QUIT       /help   /exit
 ```

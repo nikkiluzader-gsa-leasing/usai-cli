@@ -27,7 +27,15 @@ You need a USAi API key from the USAi Console (**Keys > My API keys**).
 
 3. Open a new PowerShell window and type `usai`. The first time, it asks for your API key.
 
-`-Install` copies the script to `~\.usai\bin` and adds that folder to your user PATH, so `usai` works from any folder. To update, run a newer copy with `-Install` again. To remove it, run `usai -Uninstall`.
+`-Install` copies the script to `~\.usai\bin` and adds that folder to your user PATH, so `usai` works from any folder. To remove it, run `usai -Uninstall`.
+
+### Updating
+
+Run `usai -Update` (or `usai --update`), or type `/update` in a chat. It downloads the latest `usai.ps1` from the `main` branch on GitHub, checks that it's a complete script, keeps your current copy as `~\.usai\bin\usai.ps1.bak`, and installs the new one. `/update` then offers to restart and pick up your conversation where you left off. Nothing is sent to GitHub except the download request (no API key, no conversation).
+
+Once a day, `usai` also checks in the background and tells you when a newer version is available. To turn that off, set `"updateCheck": false` in `~\.usai\config.json` (or set the `USAI_NO_UPDATE_CHECK` environment variable).
+
+`usai -Install` on its own doesn't update anything: it runs the copy that's already installed, which can only copy itself. Use `-Install` to install a specific copy you have (`.\usai.ps1 -Install` in its folder), and `-Update` to get the latest.
 
 **If Windows won't run the script:** files downloaded from the internet or email are marked as untrusted, and many machines block marked scripts. Right-click `usai.ps1`, choose **Properties**, tick **Unblock**, click **OK**, and try again. If it's still blocked, your execution policy is set by your organization; ask your IT team rather than working around it.
 
@@ -170,7 +178,7 @@ Stored locally in `~\.usai`:
 | `USAI.md` | Optional instructions for every conversation (see above) |
 | `sessions\*.json` | Saved conversations (images and PDFs are left out) |
 | `backups\*` | Copies of files from before the model changed them |
-| `bin\usai.ps1` | The installed copy of the script |
+| `bin\usai.ps1` | The installed copy of the script (`usai.ps1.bak` is the one before the last update) |
 
 You can also set the key with the `USAI_API_KEY` environment variable, which takes priority over the saved key.
 
@@ -184,7 +192,7 @@ You can also set the key with the `USAI_API_KEY` environment variable, which tak
 | `429` errors | You hit the rate limit (3 calls per second) or your weekly budget. The script retries rate limits on its own; a budget limit resets on Monday. |
 | `503` errors | That model is temporarily unavailable. The script retries twice; after that, try `/retry` later or switch with `/model`. |
 | A model rejects temperature, max tokens, streaming or tools | The script notices, drops that option for that model, and resends. `/context` shows what was dropped. |
-| An update or a change to `usai.ps1` seems to have no effect | Typing `usai` runs the installed copy in `~\.usai\bin`, not the file in the folder you're in. Run `.\usai.ps1 -Install` again after updating, or run `.\usai.ps1` directly to try a local copy. The banner warns when the folder's `usai.ps1` differs from the one running. |
+| An update or a change to `usai.ps1` seems to have no effect | Typing `usai` runs the installed copy in `~\.usai\bin`, not the file in the folder you're in. Run `usai -Update` to install the latest from GitHub, `.\usai.ps1 -Install` to install a local copy, or `.\usai.ps1` to just try a local copy. The banner warns when the folder's `usai.ps1` differs from the one running. |
 | Garbled characters | Use Windows Terminal, or a font with good Unicode coverage. |
 | Blocked as malicious content by antivirus | Let your IT or security team know; don't add an exclusion yourself. |
 

@@ -25,6 +25,8 @@
     Get-Content .\error.log | .\usai.ps1 -p "what went wrong?"
 .EXAMPLE
     .\usai.ps1 -m claude_4_5_sonnet             # use a different model this session
+.EXAMPLE
+    usai -Update                                # install the latest version from GitHub (also: usai --update, or /update in a chat)
 #>
 param(
     # First message for an interactive session.
@@ -46,7 +48,10 @@ param(
     [switch]$Install,
 
     # Undo -Install (keeps your saved key, settings and conversations in ~\.usai).
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    # Download the latest version from GitHub and install it in place of the current one.
+    [switch]$Update
 )
 
 # Capture pipeline input before anything else consumes it.
@@ -58,6 +63,10 @@ $script:PipedLines = @($input)
 
 $script:BaseUrl = 'https://api.gsa.usai.gov'
 if ($env:USAI_BASE_URL) { $script:BaseUrl = $env:USAI_BASE_URL.TrimEnd('/') }
+
+# Where -Update and /update get the latest version (the main branch on GitHub).
+$script:UpdateUrl = 'https://raw.githubusercontent.com/nikkiluzader-gsa-leasing/usai-cli/main/usai.ps1'
+if ($env:USAI_UPDATE_URL) { $script:UpdateUrl = $env:USAI_UPDATE_URL }
 
 $script:ConfigDir = Join-Path $HOME '.usai'
 $script:KeyFile = Join-Path $script:ConfigDir 'api-key.xml'
@@ -94,6 +103,8 @@ $script:Config = [ordered]@{
     folderRules  = @()       # [f]older approvals: @{ path; allow = @('edits', 'git commit', ...) }
     temperature  = $null     # $null = model default
     maxTokens    = $null     # $null = model default
+    updateCheck  = $true     # check GitHub for a newer version once a day, and say so
+    lastUpdateCheck = ''     # when that last happened (ISO date)
 }
 $script:Messages = New-Object System.Collections.Generic.List[object]
 $script:Pending = New-Object System.Collections.Generic.List[object]
@@ -114,6 +125,9 @@ $script:ReadHashes = @{}       # file -> hash of the contents the model last rea
 $script:LineBases = @{}        # file -> hash when last read_file'd: line-range edits need these line numbers to be current
 $script:DeclineNote = ''       # what the user typed after declining a step, passed on to the model
 $script:EditTipShown = $false
+$script:UpdateCheck = $null    # the background check for a newer version: @{ Task; Cts }
+$script:RestartPath = $null    # after /update: the new copy to start when this one exits
+$script:RestartContinue = $false
 $script:SessionUsage = @{ In = 0; Out = 0; Has = $false }
 $script:LongHintAt = 0         # context size (tokens) at which the /compact hint was last shown
 $script:LastRequestAt = $null
@@ -2849,6 +2863,7 @@ $script:Commands = [ordered]@{
     '/ls'      = 'List files'
     '/pwd'     = 'Show current directory'
     '/key'     = 'Replace the stored API key: /key reset'
+    '/update'  = 'Install the latest version of usai from GitHub (also: usai -Update)'
     '/exit'    = 'Quit (alias /quit)'
 }
 
@@ -3298,6 +3313,7 @@ function Invoke-SlashCommand([string]$Name, [string]$Arg) {
             }
             catch { Write-Err $_.Exception.Message }
         }
+        '/update' { Invoke-UpdateCommand }
         '/key' {
             if ($Arg -eq 'reset') { Reset-ApiKey }
             else { Write-Warn 'Usage: /key reset' }
@@ -3425,24 +3441,13 @@ function Set-UserPathEntries([string[]]$Entries) {
     [Environment]::SetEnvironmentVariable('Path', ($Entries -join ';'), 'User')
 }
 
-function Install-Usai {
+function Get-InstalledPath {
+    return (Join-Path (Join-Path $script:ConfigDir 'bin') 'usai.ps1')
+}
+
+# Puts ~\.usai\bin on the user's PATH (and this window's), so "usai" works anywhere.
+function Add-BinToPath {
     $binDir = Join-Path $script:ConfigDir 'bin'
-    $target = Join-Path $binDir 'usai.ps1'
-    $source = $PSCommandPath
-
-    if (-not (Test-Path -LiteralPath $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
-
-    if ($source -and ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target))) {
-        Copy-Item -LiteralPath $source -Destination $target -Force
-        Write-Ok "Copied the script to $target"
-    }
-    else {
-        Write-Dim "The script is already at $target"
-    }
-
-    # A downloaded copy is marked "from the internet"; the installed copy is the one you chose to trust.
-    try { Unblock-File -LiteralPath $target -ErrorAction Stop } catch { }
-
     $entries = Get-UserPathEntries
     $already = $entries | Where-Object { $_.TrimEnd('\') -ieq $binDir.TrimEnd('\') }
     if (-not $already) {
@@ -3453,10 +3458,34 @@ function Install-Usai {
         Write-Dim "$binDir is already on your PATH."
     }
     if (($env:Path -split ';') -notcontains $binDir) { $env:Path = "$env:Path;$binDir" }
+}
+
+function Install-Usai {
+    $binDir = Join-Path $script:ConfigDir 'bin'
+    $target = Get-InstalledPath
+    $source = $PSCommandPath
+
+    if (-not (Test-Path -LiteralPath $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+
+    if ($source -and ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($target))) {
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        Write-Ok "Copied the script to $target"
+    }
+    else {
+        # Typing "usai -Install" runs the installed copy, which can only copy itself onto itself.
+        Write-Warn "You ran the installed copy ($target), so there was nothing new to copy."
+        Write-Dim  '  To get the latest version, run:  usai -Update'
+        Write-Dim  '  To install a copy you have, run it by its path, e.g.  .\usai.ps1 -Install'
+    }
+
+    # A downloaded copy is marked "from the internet"; the installed copy is the one you chose to trust.
+    try { Unblock-File -LiteralPath $target -ErrorAction Stop } catch { }
+
+    Add-BinToPath
 
     Write-Host ''
     Write-Host 'Done. Open a new PowerShell window and type:  usai' -ForegroundColor Cyan
-    Write-Dim  'To update later, run the new version with -Install again. To remove: usai -Uninstall'
+    Write-Dim  'To update later: usai -Update (or /update in a chat). To remove: usai -Uninstall'
 
     $policy = Get-ExecutionPolicy
     if ($policy -in 'Restricted', 'AllSigned') {
@@ -3479,6 +3508,169 @@ function Uninstall-Usai {
         Write-Ok "Deleted $binDir"
     }
     Write-Dim "Your API key, settings and saved conversations are still in $($script:ConfigDir). Delete that folder to remove them too."
+}
+
+# ----------------------------------------------------------------------------
+# Updates: -Update, /update, and the once-a-day "newer version" notice
+# ----------------------------------------------------------------------------
+
+# Script text with the BOM and line endings evened out, so copies compare equal however git checked them out.
+function ConvertTo-ScriptText([byte[]]$Bytes) {
+    $start = if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { 3 } else { 0 }
+    return [Text.Encoding]::UTF8.GetString($Bytes, $start, $Bytes.Length - $start).Replace("`r`n", "`n")
+}
+
+# Returns why downloaded text isn't a usable usai.ps1, or $null if it is.
+function Test-ScriptText([string]$Text) {
+    if ($Text -notmatch 'function Start-Usai' -or $Text -notmatch 'USAi') { return 'the download is not usai.ps1 (a proxy or sign-in page may have answered instead)' }
+    $tokens = $null; $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { return "the download has PowerShell errors (line $($errors[0].Extent.StartLineNumber): $($errors[0].Message))" }
+    return $null
+}
+
+# Starts downloading the latest usai.ps1. No API key is sent: this goes to GitHub, not USAi.
+function Start-ScriptDownload([int]$TimeoutSec) {
+    $cts = New-Object System.Threading.CancellationTokenSource
+    $cts.CancelAfter([TimeSpan]::FromSeconds($TimeoutSec))
+    $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $script:UpdateUrl)
+    $req.Headers.UserAgent.ParseAdd('usai-cli')
+    $req.Headers.CacheControl = New-Object System.Net.Http.Headers.CacheControlHeaderValue
+    $req.Headers.CacheControl.NoCache = $true
+    $task = (Get-HttpClient).SendAsync($req, $cts.Token)
+    return @{ Task = $task; Cts = $cts }
+}
+
+# Turns a finished download into @{ Bytes } or @{ Error }.
+function Complete-ScriptDownload($Download) {
+    $t = $Download.Task
+    if ($t.IsCanceled) { return @{ Error = 'timed out' } }
+    if ($t.IsFaulted) { return @{ Error = (Get-InnermostMessage $t.Exception) } }
+    $resp = $t.Result
+    try {
+        if (-not $resp.IsSuccessStatusCode) { return @{ Error = "HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase)" } }
+        return @{ Bytes = $resp.Content.ReadAsByteArrayAsync().Result }
+    }
+    finally { $resp.Dispose() }
+}
+
+# The latest commit that changed usai.ps1, as "message (date)", or '' if GitHub can't say.
+function Get-LatestChangeNote {
+    if ($script:UpdateUrl -notmatch '^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$') { return '' }
+    $api = "https://api.github.com/repos/$($Matches[1])/$($Matches[2])/commits?sha=$($Matches[3])&path=$($Matches[4])&per_page=1"
+    try {
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $api)
+        $req.Headers.UserAgent.ParseAdd('usai-cli')
+        $cts = New-Object System.Threading.CancellationTokenSource
+        $cts.CancelAfter([TimeSpan]::FromSeconds(8))
+        $resp = (Get-HttpClient).SendAsync($req, $cts.Token).Result
+        if (-not $resp.IsSuccessStatusCode) { return '' }
+        $c = @($resp.Content.ReadAsStringAsync().Result | ConvertFrom-Json)[0].commit
+        $msg = ([string]$c.message -split "`n")[0]
+        $date = ([DateTime]$c.committer.date).ToLocalTime().ToString('MMM d, yyyy')
+        return "$msg ($date)"
+    }
+    catch { return '' }
+}
+
+# Downloads the latest version and installs it over ~\.usai\bin\usai.ps1, keeping the old one
+# as usai.ps1.bak. Returns @{ Updated; Path; Error }.
+function Update-Usai {
+    $target = Get-InstalledPath
+    Write-Dim "  Checking for the latest version ($($script:UpdateUrl))..."
+    $download = Start-ScriptDownload 60
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $spin = -not $script:OutputRedirected
+    if (-not (Wait-ForTask $download.Task $download.Cts $sw $spin)) { Clear-Spinner; Write-Warn '  Update cancelled.'; return @{ Error = 'cancelled' } }
+    Clear-Spinner
+    $got = Complete-ScriptDownload $download
+    if ($got.Error) {
+        Write-Err "  Could not download the latest version: $($got.Error)"
+        Write-Dim '  Check your network or VPN connection, then try again.'
+        return @{ Error = $got.Error }
+    }
+    $newText = ConvertTo-ScriptText $got.Bytes
+    $why = Test-ScriptText $newText
+    if ($why) {
+        Write-Err "  Not updating: $why."
+        return @{ Error = $why }
+    }
+
+    $script:Config.lastUpdateCheck = (Get-Date).ToString('o')
+    try { Save-Config } catch { }
+
+    $installed = Test-Path -LiteralPath $target -PathType Leaf
+    if ($installed -and (ConvertTo-ScriptText ([IO.File]::ReadAllBytes($target))) -ceq $newText) {
+        Write-Ok '  usai is up to date.'
+        if ($PSCommandPath -and [IO.Path]::GetFullPath($PSCommandPath) -ne [IO.Path]::GetFullPath($target)) {
+            Write-Dim "  (That's the installed copy, $target. You're running $PSCommandPath.)"
+        }
+        return @{ Updated = $false; Path = $target }
+    }
+
+    try {
+        $ProgressPreference = 'SilentlyContinue'   # PowerShell 7 draws a progress bar for Copy-Item
+        $binDir = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+        if ($installed) { Copy-Item -LiteralPath $target -Destination "$target.bak" -Force }
+        # Write next to the target first, so a failure can't leave half a script installed.
+        $temp = "$target.new"
+        [IO.File]::WriteAllBytes($temp, $got.Bytes)
+        Move-Item -LiteralPath $temp -Destination $target -Force
+        try { Unblock-File -LiteralPath $target -ErrorAction Stop } catch { }
+    }
+    catch {
+        Write-Err "  Could not install the update: $($_.Exception.Message)"
+        return @{ Error = $_.Exception.Message }
+    }
+
+    Write-Ok "  Updated usai at $target"
+    $note = Get-LatestChangeNote
+    if ($note) { Write-Dim "  Latest change: $note" }
+    if ($installed) { Write-Dim "  The previous version is saved as $target.bak" }
+    else { Add-BinToPath }
+    return @{ Updated = $true; Path = $target }
+}
+
+# /update: update, then offer to restart into the new version and pick up this conversation.
+function Invoke-UpdateCommand {
+    $r = Update-Usai
+    if (-not $r.Updated) { return }
+    if (Read-YesNo 'Restart usai now to use it?') {
+        if ($script:Messages.Count -gt 0) { Save-Session; $script:RestartContinue = $true }
+        $script:RestartPath = $r.Path
+        $script:ExitRequested = $true
+    }
+    else { Write-Dim '  The new version starts the next time you run usai.' }
+}
+
+# Once a day, look for a newer version in the background; Show-UpdateNotice reports it.
+function Start-UpdateCheck {
+    if (-not $script:Config.updateCheck -or $env:USAI_NO_UPDATE_CHECK) { return }
+    $last = [DateTime]::MinValue
+    if ($script:Config.lastUpdateCheck) { [void][DateTime]::TryParse([string]$script:Config.lastUpdateCheck, [ref]$last) }
+    if (((Get-Date) - $last).TotalHours -lt 20) { return }
+    try { $script:UpdateCheck = Start-ScriptDownload 15 } catch { $script:UpdateCheck = $null }
+}
+
+function Show-UpdateNotice {
+    $check = $script:UpdateCheck
+    if (-not $check -or -not $check.Task.IsCompleted) { return }
+    $script:UpdateCheck = $null
+    try {
+        $got = Complete-ScriptDownload $check
+        if ($got.Error) { return }   # offline or blocked: try again next time
+        $script:Config.lastUpdateCheck = (Get-Date).ToString('o')
+        Save-Config
+        $newText = ConvertTo-ScriptText $got.Bytes
+        if (Test-ScriptText $newText) { return }
+        $mine = Get-InstalledPath
+        if (-not (Test-Path -LiteralPath $mine -PathType Leaf)) { $mine = $PSCommandPath }
+        if (-not $mine -or (ConvertTo-ScriptText ([IO.File]::ReadAllBytes($mine))) -ceq $newText) { return }
+        Write-Host '  A newer version of usai is available. Type /update to install it.' -ForegroundColor Cyan
+        Write-Host ''
+    }
+    catch { }
 }
 
 # ----------------------------------------------------------------------------
@@ -3517,10 +3709,22 @@ function Invoke-PrintMode([string]$Prompt, [string]$Stdin) {
 function Start-Usai {
     Initialize-Console
 
-    if ($Install) { Install-Usai; return 0 }
-    if ($Uninstall) { Uninstall-Usai; return 0 }
+    # Typed at a PowerShell prompt, "usai --update" arrives as the first message rather than as -Update.
+    $doInstall = $Install -or $Query -match '^--?install$'
+    $doUninstall = $Uninstall -or $Query -match '^--?uninstall$'
+    $doUpdate = $Update -or $Query -match '^--?update$'
+
+    if ($doInstall) { Install-Usai; return 0 }
+    if ($doUninstall) { Uninstall-Usai; return 0 }
 
     Read-Config
+
+    if ($doUpdate) {
+        $r = Update-Usai
+        if ($r.Error) { return 1 }
+        if ($r.Updated) { Write-Dim '  Open usai again to use the new version.' }
+        return 0
+    }
 
     $script:CurrentModel = if ($Model) { $Model } else { [string]$script:Config.model }
     $script:StreamOn = [bool]$script:Config.stream -and -not $NoStream
@@ -3546,6 +3750,7 @@ function Start-Usai {
     }
 
     Show-Banner
+    Start-UpdateCheck
 
     if ($Continue) {
         $latest = @(Get-SavedSessions | Select-Object -First 1)
@@ -3561,6 +3766,7 @@ function Start-Usai {
     }
 
     while ($true) {
+        Show-UpdateNotice
         $text = Read-UserInput
         if ($null -eq $text) { break }
         $trimmed = $text.Trim()
@@ -3588,4 +3794,10 @@ $script:PrintText = $null
 $script:ExitRequested = $false
 $exitCode = @(Start-Usai) | Select-Object -Last 1
 if ($null -ne $script:PrintText) { Write-Output $script:PrintText }
+if ($script:RestartPath) {
+    # After /update: start the new version, picking up this conversation if there was one.
+    Write-Host ''
+    if ($script:RestartContinue) { & $script:RestartPath -Continue } else { & $script:RestartPath }
+    exit $LASTEXITCODE
+}
 if ($exitCode -is [int] -and $exitCode -ne 0) { exit $exitCode }
